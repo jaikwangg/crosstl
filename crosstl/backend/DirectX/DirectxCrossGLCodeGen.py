@@ -358,6 +358,9 @@ class HLSLToCrossGLConverter(
             "fmod": "fmod",
             "lerp": "mix",
             "reversebits": "bitfieldReverse",
+            # HLSL round rounds halfway cases to the nearest even integer (DXC lowers it to Round_ne); CrossGL round
+            # leaves them implementation-defined, as GLSL does.
+            "round": "roundEven",
             "rsqrt": "inverseSqrt",
             "atan2": "atan",
             "EvaluateAttributeAtSample": "interpolateAtSample",
@@ -5304,7 +5307,8 @@ class HLSLToCrossGLConverter(
             )
             if precise_call is not None:
                 return precise_call
-            func_name = self.function_map.get(func_name, func_name)
+            if func_name != "round" or func_name not in self.source_function_names:
+                func_name = self.function_map.get(func_name, func_name)
             func_name = self.interlocked_map.get(func_name, func_name)
             integer_shape = source_integer_shape(self.resolve_integer_alias(func_name))
             if (

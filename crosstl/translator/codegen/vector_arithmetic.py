@@ -148,6 +148,7 @@ class VectorArithmeticMixin:
                     "floor",
                     "ceil",
                     "round",
+                    "roundEven",
                     "trunc",
                     "saturate",
                 }
@@ -1823,6 +1824,7 @@ class VectorArithmeticMixin:
             "floor": {"float": "floorf", "double": "floor"},
             "ceil": {"float": "ceilf", "double": "ceil"},
             "round": {"float": "roundf", "double": "round"},
+            "roundEven": {"float": "rintf", "double": "rint"},
             "trunc": {"float": "truncf", "double": "trunc"},
             "inversesqrt": {"float": "rsqrtf", "double": "sqrt"},
         }

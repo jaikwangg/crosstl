@@ -348,6 +348,8 @@ class SlangCodeGen(LoweringRefusalMixin):
             "dFdyFine": "ddy_fine",
             "inversesqrt": "rsqrt",
             "inverseSqrt": "rsqrt",
+            # Slang round(), like HLSL round(), rounds halfway cases to the nearest even integer.
+            "roundEven": "round",
             "floatBitsToInt": "asint",
             "floatBitsToUint": "asuint",
             "intBitsToFloat": "asfloat",
