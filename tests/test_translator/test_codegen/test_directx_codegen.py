@@ -14492,15 +14492,15 @@ def test_hlsl_glsl_buffer_block_fixed_width_aliases_lower_to_byteaddressbuffer()
     generated_code = generate_code(parse_code(tokenize_code(shader)))
 
     assert "RWByteAddressBuffer aliasBlock : register(u7);" in generated_code
-    assert "uint16_t word = aliasBlock.Load(4);" in generated_code
-    assert "uint64_t(aliasBlock.Load((8 + index * 4)))" in generated_code
+    assert "uint16_t word = aliasBlock.Load<uint16_t>(2);" in generated_code
+    assert "uint64_t(aliasBlock.Load((4 + index * 4)))" in generated_code
     assert (
         "void writeAlias(uint index, uint16_t word, uint64_t offset)" in generated_code
     )
-    assert "aliasBlock.Store(4, uint(word));" in generated_code
-    assert "aliasBlock.Store((8 + index * 4), uint(offset));" in generated_code
+    assert "aliasBlock.Store<uint16_t>(2, uint16_t(word));" in generated_code
+    assert "aliasBlock.Store((4 + index * 4), uint(offset));" in generated_code
     assert (
-        "aliasBlock.Store(0, uint((aliasBlock.Load(0) + uint16_t(1u))));"
+        "aliasBlock.Store<uint16_t>(0, uint16_t((aliasBlock.Load<uint16_t>(0) + uint16_t(1u))));"
         in generated_code
     )
     assert "unsupported HLSL GLSL buffer block" not in generated_code
@@ -16109,6 +16109,118 @@ def test_directx_byte_address_interlocked_member_calls_are_preserved():
     )
 
 
+@pytest.mark.parametrize("method_name", ["InterlockedMax", "InterlockedMin"])
+def test_directx_byte_address_interlocked_min_max_accept_signed_value(method_name):
+    shader = f"""
+    shader ByteAddressSignedInterlockedHLSL {{
+        RWByteAddressBuffer rawBytes @register(u0);
+        RWStructuredBuffer<int> signedValues @register(u1);
+
+        compute {{
+            @numthreads(1, 1, 1)
+            void main(uvec3 tid @gl_GlobalInvocationID) {{
+                int value = signedValues[tid.x];
+                int original = 0;
+                rawBytes.{method_name}(0u, value);
+                rawBytes.{method_name}(4u, value, original);
+                signedValues[0] = original;
+            }}
+        }}
+    }}
+    """
+
+    generated_code = generate_code(parse_code(tokenize_code(shader)))
+
+    assert f"rawBytes.{method_name}(0u, value);" in generated_code
+    assert f"rawBytes.{method_name}(4u, value, original);" in generated_code
+
+
+def test_directx_byte_address_interlocked_add_rejects_signed_value():
+    shader = """
+    shader ByteAddressSignedInterlockedAddHLSL {
+        RWByteAddressBuffer rawBytes @register(u0);
+
+        compute {
+            @numthreads(1, 1, 1)
+            void main() {
+                int value = -1;
+                rawBytes.InterlockedAdd(0u, value);
+            }
+        }
+    }
+    """
+
+    match = (
+        "DirectX ByteAddressBuffer interlocked member 'InterlockedAdd' "
+        "value argument must be scalar uint, got int"
+    )
+    with pytest.raises(ValueError, match=re.escape(match)):
+        generate_code(parse_code(tokenize_code(shader)))
+
+
+@pytest.mark.parametrize("method_name", ["InterlockedMax", "InterlockedMin"])
+def test_directx_byte_address_interlocked_min_max_literal_value_stays_unsigned(
+    method_name,
+):
+    """DXC reads ``InterlockedMax(0, 5)`` as the unsigned UMax, so ``5`` is a uint
+    value: the call is written as before and an ``int`` original is refused."""
+    shader = f"""
+    shader ByteAddressLiteralInterlockedHLSL {{
+        RWByteAddressBuffer rawBytes @register(u0);
+        RWStructuredBuffer<int> signedValues @register(u1);
+
+        compute {{
+            @numthreads(1, 1, 1)
+            void main() {{
+                int original = 0;
+                rawBytes.{method_name}(0u, 5);
+                rawBytes.{method_name}(4u, -1);
+                rawBytes.{method_name}(8u, 5, original);
+                signedValues[0] = original;
+            }}
+        }}
+    }}
+    """
+
+    match = (
+        f"DirectX ByteAddressBuffer interlocked member '{method_name}' "
+        "original argument must be scalar uint, got int"
+    )
+    with pytest.raises(ValueError, match=re.escape(match)):
+        generate_code(parse_code(tokenize_code(shader)))
+
+    accepted = shader.replace(f"rawBytes.{method_name}(8u, 5, original);", "")
+    generated_code = generate_code(parse_code(tokenize_code(accepted)))
+
+    assert f"rawBytes.{method_name}(0u, 5);" in generated_code
+    assert f"rawBytes.{method_name}(4u, -1);" in generated_code
+
+
+def test_directx_byte_address_interlocked_signed_max_names_int_original():
+    shader = """
+    shader ByteAddressSignedInterlockedOriginalHLSL {
+        RWByteAddressBuffer rawBytes @register(u0);
+        RWStructuredBuffer<int> signedValues @register(u1);
+
+        compute {
+            @numthreads(1, 1, 1)
+            void main(uvec3 tid @gl_GlobalInvocationID) {
+                int value = signedValues[tid.x];
+                float original = 0.0;
+                rawBytes.InterlockedMax(0u, value, original);
+            }
+        }
+    }
+    """
+
+    match = (
+        "DirectX ByteAddressBuffer interlocked member 'InterlockedMax' "
+        "original argument must be scalar int or uint, got float"
+    )
+    with pytest.raises(ValueError, match=re.escape(match)):
+        generate_code(parse_code(tokenize_code(shader)))
+
+
 @pytest.mark.parametrize(
     ("declaration", "call", "match"),
     [
@@ -16154,6 +16266,38 @@ def test_directx_byte_address_interlocked_member_calls_are_preserved():
             "uint oldValue = 0u; rawBytes.InterlockedAdd(0u, 1.0, oldValue);",
             "DirectX ByteAddressBuffer interlocked member 'InterlockedAdd' "
             "value argument must be scalar uint, got float",
+        ),
+        (
+            "RWByteAddressBuffer rawBytes @register(u3);",
+            "int64_t wide = int64_t(5); rawBytes.InterlockedMax(0u, wide);",
+            "DirectX ByteAddressBuffer interlocked member 'InterlockedMax' "
+            "value argument must be scalar uint, got int64_t",
+        ),
+        (
+            "RWByteAddressBuffer rawBytes @register(u3);",
+            "bool flag = true; rawBytes.InterlockedMax(0u, flag);",
+            "DirectX ByteAddressBuffer interlocked member 'InterlockedMax' "
+            "value argument must be scalar uint, got bool",
+        ),
+        (
+            "RWByteAddressBuffer rawBytes @register(u3);",
+            "uint64_t wide = uint64_t(5); rawBytes.InterlockedAdd(0u, wide);",
+            "DirectX ByteAddressBuffer interlocked member 'InterlockedAdd' "
+            "value argument must be scalar uint, got uint64_t",
+        ),
+        (
+            "RWByteAddressBuffer rawBytes @register(u3);",
+            "uint oldValue = 0u; bool flag = true; "
+            "rawBytes.InterlockedCompareExchange(0u, flag, 1u, oldValue);",
+            "DirectX ByteAddressBuffer interlocked member "
+            "'InterlockedCompareExchange' compare value argument must be scalar "
+            "uint, got bool",
+        ),
+        (
+            "RWByteAddressBuffer rawBytes @register(u3);",
+            "int64_t address = int64_t(0); rawBytes.InterlockedAdd(address, 1u);",
+            "DirectX ByteAddressBuffer interlocked member 'InterlockedAdd' "
+            "address argument must be scalar uint, got int64_t",
         ),
         (
             "RWByteAddressBuffer rawBytes @register(u3);",
@@ -32112,17 +32256,17 @@ def test_directx_explicit_narrow_rg_image_formats():
     ast = crosstl.translator.parse(shader)
     generated_code = HLSLCodeGen().generate(ast)
 
-    assert "RWTexture2D<float2> rg8Float : register(u0);" in generated_code
-    assert "RWTexture2D<float2> rg8Snorm : register(u1);" in generated_code
-    assert "RWTexture3D<float2> rg16Float : register(u2);" in generated_code
-    assert "RWTexture2D<float2> rg16Snorm : register(u3);" in generated_code
+    assert "RWTexture2D<unorm float2> rg8Float : register(u0);" in generated_code
+    assert "RWTexture2D<snorm float2> rg8Snorm : register(u1);" in generated_code
+    assert "RWTexture3D<unorm float2> rg16Float : register(u2);" in generated_code
+    assert "RWTexture2D<snorm float2> rg16Snorm : register(u3);" in generated_code
     assert "RWTexture2DArray<float2> rg16Half : register(u4);" in generated_code
     assert "RWTexture2D<int2> rg8Signed : register(u5);" in generated_code
     assert "RWTexture3D<int2> rg16Signed : register(u6);" in generated_code
     assert "RWTexture2D<uint2> rg8Unsigned : register(u7);" in generated_code
     assert "RWTexture2DArray<uint2> rg16Unsigned : register(u8);" in generated_code
     assert (
-        "float2 touchFloat(RWTexture2D<float2> image, int2 pixel, float2 value)"
+        "float2 touchFloat(RWTexture2D<unorm float2> image, int2 pixel, float2 value)"
         in generated_code
     )
     assert (
@@ -32187,14 +32331,14 @@ def test_directx_explicit_rgba_float_image_formats():
     ast = crosstl.translator.parse(shader)
     generated_code = HLSLCodeGen().generate(ast)
 
-    assert "RWTexture2D<float4> rgba8Color : register(u0);" in generated_code
-    assert "RWTexture2D<float4> rgba8Snorm : register(u1);" in generated_code
-    assert "RWTexture3D<float4> rgba16Color : register(u2);" in generated_code
-    assert "RWTexture2D<float4> rgba16Snorm : register(u3);" in generated_code
+    assert "RWTexture2D<unorm float4> rgba8Color : register(u0);" in generated_code
+    assert "RWTexture2D<snorm float4> rgba8Snorm : register(u1);" in generated_code
+    assert "RWTexture3D<unorm float4> rgba16Color : register(u2);" in generated_code
+    assert "RWTexture2D<snorm float4> rgba16Snorm : register(u3);" in generated_code
     assert "RWTexture2DArray<float4> rgba16Half : register(u4);" in generated_code
     assert "RWTexture3D<float4> rgba32Float : register(u5);" in generated_code
     assert (
-        "float4 touchColor(RWTexture2D<float4> image, int2 pixel, float4 value)"
+        "float4 touchColor(RWTexture2D<unorm float4> image, int2 pixel, float4 value)"
         in generated_code
     )
     assert (
@@ -33885,16 +34029,16 @@ def test_directx_explicit_scalar_float_image_formats():
     ast = crosstl.translator.parse(shader)
     generated_code = HLSLCodeGen().generate(ast)
 
-    assert "RWTexture2D<float> normalized8 : register(u0);" in generated_code
-    assert "RWTexture3D<float> normalized16 : register(u1);" in generated_code
+    assert "RWTexture2D<unorm float> normalized8 : register(u0);" in generated_code
+    assert "RWTexture3D<unorm float> normalized16 : register(u1);" in generated_code
     assert "RWTexture2DArray<float> halfLayers : register(u2);" in generated_code
-    assert "RWTexture2D<float> signedNormalized : register(u3);" in generated_code
+    assert "RWTexture2D<snorm float> signedNormalized : register(u3);" in generated_code
     assert (
-        "float touchR8(RWTexture2D<float> image, int2 pixel, float value)"
+        "float touchR8(RWTexture2D<unorm float> image, int2 pixel, float value)"
         in generated_code
     )
     assert (
-        "float touchR16(RWTexture3D<float> image, int3 voxel, float value)"
+        "float touchR16(RWTexture3D<unorm float> image, int3 voxel, float value)"
         in generated_code
     )
     assert (

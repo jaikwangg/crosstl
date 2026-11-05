@@ -4,6 +4,7 @@ import pytest
 
 import crosstl.translator as cgl_translator
 from crosstl import translate
+from crosstl.backend.import_refusals import SlangImportRefused
 from crosstl.backend.slang import SlangCrossGLCodeGen, SlangLexer, SlangParser
 from crosstl.translator.ast import ShaderStage
 
@@ -200,7 +201,10 @@ def test_numthreads_without_shader_attribute_codegen_emits_compute_layout():
         in generated_code
     )
     assert "uvec3 dispatchThreadId @ gl_GlobalInvocationID" in generated_code
-    assert "gStatsRayCountTotal[dispatchThreadId.xy] = totalRays;" in generated_code
+    assert (
+        "imageStore(gStatsRayCountTotal, dispatchThreadId.xy, "
+        "uvec4(totalRays, 0u, 0u, 1u));" in generated_code
+    )
     cgl_translator.parse(generated_code)
 
 
@@ -887,7 +891,7 @@ def test_common_hlsl_system_semantics_codegen_maps_to_crossgl_builtins_case_inse
     ast = parse_code(tokens)
     generated_code = generate_code(ast)
 
-    assert "uint vertexId @ gl_VertexID" in generated_code
+    assert "uint vertexId @ gl_RelativeVertexID" in generated_code
     assert "uint instanceId @ gl_InstanceID" in generated_code
     assert "bool frontFace @ gl_FrontFacing" in generated_code
     assert "uint sampleIndex @ gl_SampleID" in generated_code
@@ -2498,11 +2502,12 @@ def test_namespace_global_resource_array_codegen_from_current_slang_spirv_test()
 
     assert "ComputePush p @push_constant;" in generated_code
     assert (
-        "image2D test_namespace_textureTable[] @set(0) @binding(0);" in generated_code
+        "image2D test_namespace_textureTable[] @set(0) @binding(0) @format(unknown);"
+        in generated_code
     )
     assert (
-        "test_namespace_textureTable[p.image_id][pixel_i.xy] = "
-        "vec4(0, 1, 0, 0);" in generated_code
+        "imageStore(test_namespace_textureTable[p.image_id], pixel_i.xy, "
+        "vec4(0, 1, 0, 0));" in generated_code
     )
     assert "test_namespace.textureTable" not in generated_code
     cgl_translator.parse(generated_code)
@@ -2528,8 +2533,14 @@ def test_dotted_namespace_global_resource_codegen_from_namespace_import_sample()
     ast = parse_code(tokens)
     generated_code = generate_code(ast)
 
-    assert "image2D ns1_ns2_textureTable[] @set(0) @binding(0);" in generated_code
-    assert "ns1_ns2_textureTable[0][pixel_i.xy] = vec4(0, 1, 0, 0);" in generated_code
+    assert (
+        "image2D ns1_ns2_textureTable[] @set(0) @binding(0) @format(unknown);"
+        in generated_code
+    )
+    assert (
+        "imageStore(ns1_ns2_textureTable[0], pixel_i.xy, vec4(0, 1, 0, 0));"
+        in generated_code
+    )
     assert "ns1.ns2.textureTable" not in generated_code
     cgl_translator.parse(generated_code)
 
@@ -2593,7 +2604,7 @@ def test_parameter_attribute_codegen_from_cuda_format_docs_reparses():
     generated_code = generate_code(ast)
 
     assert "vec2 getValue(image2D t)" in generated_code
-    assert "return t[ivec2(0, 0)];" in generated_code
+    assert "return imageLoad(t, ivec2(0, 0)).xy;" in generated_code
     assert "[format" not in generated_code
     cgl_translator.parse(generated_code)
 
@@ -4329,6 +4340,100 @@ def test_c_style_user_type_identifier_cast_codegen_reparse_from_enum_sample():
     cgl_translator.parse(generated_code)
 
 
+def test_c_style_array_type_cast_codegen_reparse():
+    code = """
+    RWStructuredBuffer<float> outp;
+    [shader("compute")]
+    [numthreads(1, 1, 1)]
+    void probe(uint3 tid : SV_DispatchThreadID) {
+        float a[3] = (float[3])0;
+        float4 v[2] = (float4[2])0;
+        a[1] = outp[tid.x];
+        outp[tid.x] = a[0] + a[1] + v[1].x;
+    }
+    """
+
+    tokens = tokenize_code(code)
+    ast = parse_code(tokens)
+    generated_code = generate_code(ast)
+
+    assert "float a[3] = float[3](0);" in generated_code
+    assert "vec4 v[2] = vec4[2](0);" in generated_code
+    cgl_translator.parse(generated_code)
+
+
+@pytest.mark.parametrize(
+    ("cast", "expected"),
+    [
+        ("(float[3])0.0", "float[3](0.0)"),
+        ("(float[3])0.0f", "float[3](0.0)"),
+        ("(uint[3])0u", "uint[3](0u)"),
+        ("(int[N])0", "int[N](0)"),
+    ],
+)
+def test_c_style_array_type_cast_of_a_zero_literal_codegen(cast, expected):
+    code = f"""
+    static const int N = 3;
+    RWStructuredBuffer<float> outp;
+    [shader("compute")]
+    [numthreads(1, 1, 1)]
+    void probe(uint3 tid : SV_DispatchThreadID) {{
+        let a = {cast};
+        outp[tid.x] = float(a[2]);
+    }}
+    """
+
+    generated_code = generate_code(parse_code(tokenize_code(code)))
+
+    assert expected in generated_code
+
+
+@pytest.mark.parametrize(
+    "cast",
+    [
+        # Slang fills only the first element from a scalar, HLSL every element.
+        "(float[3])2.0",
+        "(float[3])x",
+        "(float[3])values",
+        "(float[3])(x - x)",
+        "(float[2][3])0",
+    ],
+)
+def test_c_style_array_type_cast_of_another_operand_is_refused(cast):
+    code = f"""
+    RWStructuredBuffer<float> outp;
+    [shader("compute")]
+    [numthreads(1, 1, 1)]
+    void probe(uint3 tid : SV_DispatchThreadID) {{
+        float x = outp[tid.x];
+        float values[3] = {{ 1.0, 2.0, 3.0 }};
+        let a = {cast};
+        outp[tid.x] = a[0];
+    }}
+    """
+
+    with pytest.raises(SlangImportRefused, match="cast to the array type"):
+        generate_code(parse_code(tokenize_code(code)))
+
+
+def test_parenthesized_index_expression_is_not_an_array_cast():
+    code = """
+    RWStructuredBuffer<float> outp;
+    [shader("compute")]
+    [numthreads(1, 1, 1)]
+    void probe(uint3 tid : SV_DispatchThreadID) {
+        float values[2] = { 1.0, 2.0 };
+        outp[tid.x] = (values[1]) - 1.0;
+    }
+    """
+
+    tokens = tokenize_code(code)
+    ast = parse_code(tokens)
+    generated_code = generate_code(ast)
+
+    assert "outp[tid.x] = values[1] - 1.0;" in generated_code
+
+
 def test_rwtexture_load_codegen_from_official_texture_capability_sample():
     code = """
     RWStructuredBuffer<int> outputBuffer;
@@ -4347,7 +4452,7 @@ def test_rwtexture_load_codegen_from_official_texture_capability_sample():
     ast = parse_code(tokens)
     generated_code = generate_code(ast)
 
-    assert "image2D texHandle;" in generated_code
+    assert "image2D texHandle @format(unknown);" in generated_code
     assert "ret = int(imageLoad(texHandle, ivec2(0, 0)).x);" in generated_code
     assert "RWTexture2D<float4> texHandle;" not in generated_code
     assert ".Load(" not in generated_code
@@ -4371,7 +4476,7 @@ def test_rwtexture_store_codegen_from_slang_stdlib_texture_store_docs():
     ast = parse_code(tokens)
     generated_code = generate_code(ast)
 
-    assert "image2D texHandle;" in generated_code
+    assert "image2D texHandle @format(unknown);" in generated_code
     assert "imageStore(texHandle, pixel, color);" in generated_code
     assert "RWTexture2D<float4> texHandle;" not in generated_code
     assert ".Store(" not in generated_code
@@ -4393,7 +4498,10 @@ def test_parenthesized_expression_swizzle_codegen_from_autodiff_texture_learnmip
     ast = parse_code(tokens)
     generated_code = generate_code(ast)
 
-    assert "vec4 color = vec4((dstTexture[p] - val).xyz, 1.0);" in generated_code
+    assert (
+        "vec4 color = vec4((imageLoad(dstTexture, p) - val).xyz, 1.0);"
+        in generated_code
+    )
     assert "dstTexture[p] - val.xyz" not in generated_code
 
 

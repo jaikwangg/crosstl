@@ -84,6 +84,7 @@ from ..metadata_preconditions import (
 )
 from ..resource_identity import resource_identity_marker
 from ..semantics.constant_buffers import constant_buffer_element
+from ..semantics.hlsl_geometry_streams import EMPTY_STREAM_VERTEX_ATTRIBUTE
 from ..semantics.hlsl_ray_payloads import (
     PAYLOAD_ACCESS_ATTRIBUTES,
     PAYLOAD_STAGES,
@@ -177,6 +178,10 @@ from .constant_guards import (
     guard_bool_value,
 )
 from .constant_ordering import partition_constants_by_struct_dependency
+from .cooperative_matrix_diagonal import (
+    generate_hlsl_cooperative_matrix_diagonal,
+    generate_hlsl_cooperative_matrix_diagonal_helpers,
+)
 from .counter_loops import (
     any_start_counter_loop_terminates,
     any_start_counter_loops,
@@ -272,6 +277,12 @@ from .hlsl_bfloat16_vectors import (
 )
 from .hlsl_buffer_component_stores import buffer_component_store
 from .hlsl_buffer_layout import HlslLayoutError, cbuffer_placement
+from .hlsl_byteaddress_typed_access import (
+    hlsl_byteaddress_component_refusal,
+    hlsl_byteaddress_is_typed_access,
+    hlsl_byteaddress_typed_load,
+    hlsl_byteaddress_typed_store,
+)
 from .hlsl_constant_matrices import hlsl_constant_matrix_member_type
 from .hlsl_extension_builtins import (
     HLSL_GLSL_SYSTEM_VALUES,
@@ -281,7 +292,15 @@ from .hlsl_extension_builtins import (
     refuse_unmapped_hlsl_builtin,
 )
 from .hlsl_glsl_block_registers import HlslGlslBlockRegisters, HlslRegisterBlockPlan
+from .hlsl_half_private_storage import lower_half_private_storage
 from .hlsl_half_storage import HLSLHalfStorage
+from .hlsl_image_formats import (
+    declared_texel_type,
+    dxc_vulkan_image_format_prefix,
+    normalized_texel_type,
+    strip_texel_modifier,
+    texel_attribute,
+)
 from .hlsl_keyword_names import legalize_hlsl_keyword_names
 from .hlsl_matrix_orientation import HLSLMatrixOrientation
 from .hlsl_mesh_semantics import collect_hlsl_mesh_output_struct_offsets
@@ -290,6 +309,7 @@ from .hlsl_narrow_system_values import (
     HLSL_NARROW_UNSIGNED_SYSTEM_VALUE_TYPES,
     hlsl_narrow_compute_system_value_bridge,
 )
+from .hlsl_push_constants import hlsl_push_constant_block, is_push_constant
 from .hlsl_ray_queries import (
     hlsl_ray_query_expression,
     hlsl_ray_query_helpers,
@@ -315,6 +335,7 @@ from .hlsl_texture_residency import (
     hlsl_texture_resident_call,
 )
 from .hlsl_unavailable_builtins import hlsl_unavailable_builtin
+from .hlsl_unrepresentable_memory import hlsl_unrepresentable_memory_qualifier
 from .hlsl_wave_extended import (
     emit_hlsl_wave_extension_helpers,
     hlsl_subgroup_lane_mask_expression,
@@ -509,6 +530,7 @@ from .match_utils import (
     is_switch_lowerable_match,
 )
 from .matrix_compound_assignment import matrix_product_assignment
+from .memory_qualifier_names import memory_qualifier_name
 from .metadata_call_bounds import (
     call_parameter_bounds,
     inherited_metadata_bindings,
@@ -521,7 +543,12 @@ from .pointer_reinterpret import (
     same_scalar_lane_view,
     scalar_storage_layout,
 )
+from .private_array_rows import aliased_row_view, array_row_shape, array_row_view
 from .private_member_views import hlsl_aliased_scalar_view, hlsl_member_view_root
+from .private_pointer_alias_views import (
+    hlsl_aliased_writable_view,
+    hlsl_writable_pointer_parameters,
+)
 from .private_vector_views import lower_private_vector_views
 from .reference_aliases import lower_reference_aliases, references_provably_disjoint
 from .relational_builtins import lower_relational_builtins
@@ -538,6 +565,7 @@ from .software_quad_reductions import (
     hlsl_quad_sum_body,
     quad_builtin_expression,
 )
+from .specialized_workgroup_size import require_fixed_workgroup_size
 from .stage_distance_layout import distance_semantic
 from .stage_refusals import RayStageInterfaceUnsupportedError
 from .stage_utils import (
@@ -567,6 +595,7 @@ from .storage_image_texels import (
     store_value_allowed,
     texel_vector_type,
 )
+from .storage_parameter_texels import StorageParameterTexels
 from .subgroup_control_flow import (
     converge_subgroup_bounded_loops,
     converge_subgroup_conditional_calls,
@@ -2491,6 +2520,7 @@ class HLSLCodeGen(
         self.directx_cooperative_matrix_lowerings = {}
         self.required_hlsl_cooperative_matrix_mma = False
         self.required_hlsl_cooperative_matrix_fragment_offset = False
+        self.required_hlsl_cooperative_matrix_diagonals = {}
         self.texture_variables = set()
         self.sampler_variables = set()
         self.global_mixed_sampler_names = set()
@@ -2512,6 +2542,7 @@ class HLSLCodeGen(
         self.hlsl_buffer_length = HlslBufferLength()
         self.hlsl_texel_buffers = HLSLTexelBuffers(self)
         self.hlsl_atomic_resources = HLSLAtomicResources(self)
+        self.storage_parameter_texels = StorageParameterTexels(self.resource_base_type)
         self.hlsl_image_load_swizzle_extent = None
         self.hlsl_matrix_orientation = HLSLMatrixOrientation(self)
         self.required_image_atomic_helpers = set()
@@ -3022,6 +3053,7 @@ class HLSLCodeGen(
             "gl_IsFrontFace": "SV_IsFrontFace",
             "gl_FrontFacing": "SV_IsFrontFace",
             "gl_PrimitiveID": "SV_PrimitiveID",
+            "gl_CullPrimitiveEXT": "SV_CullPrimitive",
             "gl_ViewIndex": "SV_ViewID",
             "gl_Layer": "SV_RenderTargetArrayIndex",
             "gl_ViewportIndex": "SV_ViewportArrayIndex",
@@ -3030,7 +3062,9 @@ class HLSLCodeGen(
             "gl_Position": "SV_POSITION",
             "gl_FragCoord": "SV_Position",
             "gl_BaryCoordEXT": "SV_Barycentrics",
-            "gl_BaryCoordNoPerspEXT": "SV_Barycentrics",
+            # Semantic index 1, so that it does not overlap a perspective-correct SV_Barycentrics input (DXC
+            # rejects two SV_Barycentrics parameters with the same index).
+            "gl_BaryCoordNoPerspEXT": "SV_Barycentrics1",
             "gl_PointSize": "PSIZE",
             "gl_ClipDistance": "SV_ClipDistance",
             "gl_CullDistance": "SV_CullDistance",
@@ -3870,10 +3904,13 @@ class HLSLCodeGen(
             if getattr(node, "is_type_alias", False)
             and node.name not in self.METAL_TYPE_ALIAS_GLOBALS
         }
+        # Typed binary16 loads, stores and selections may change NaN payloads.
+        ast = lower_half_private_storage(ast, self.map_type)
         target_stage = normalize_stage_name(target_stage)
         self.directx_cooperative_matrix_lowerings = {}
         self.required_hlsl_cooperative_matrix_mma = False
         self.required_hlsl_cooperative_matrix_fragment_offset = False
+        self.required_hlsl_cooperative_matrix_diagonals = {}
         self.hlsl_builtin_option_available = False
         ast = self.with_hlsl_builtin_option_prelude(ast)
         if self.software_subgroup_width is not None:
@@ -3926,6 +3963,7 @@ class HLSLCodeGen(
         self.hlsl_buffer_length = HlslBufferLength()
         self.hlsl_texel_buffers = HLSLTexelBuffers(self)
         self.hlsl_atomic_resources = HLSLAtomicResources(self)
+        self.storage_parameter_texels = StorageParameterTexels(self.resource_base_type)
         self.hlsl_image_load_swizzle_extent = None
         self.hlsl_matrix_orientation = HLSLMatrixOrientation(self)
         self.required_image_atomic_helpers = set()
@@ -4347,6 +4385,9 @@ class HLSLCodeGen(
             unsupported_type_message=(
                 "type is not supported by ByteAddressBuffer lowering"
             ),
+            component_refusal=lambda info: hlsl_byteaddress_component_refusal(
+                self, info
+            ),
         )
         self.record_unsupported_glsl_buffer_block_layout_failures(
             global_vars,
@@ -4562,6 +4603,7 @@ class HLSLCodeGen(
         )
 
         self.hlsl_atomic_resources.prepare(ast)
+        self.storage_parameter_texels.prepare(ast)
         comparison_texture_names, comparison_sampler_names = (
             self.collect_comparison_resources(ast)
         )
@@ -4763,6 +4805,9 @@ class HLSLCodeGen(
                     f"{mapped_type}{array_suffix}", var_name
                 )
                 qualifier = self.resource_memory_qualifier(mapped_type, node)
+                qualifier = (
+                    self.storage_image_format_prefix(mapped_type, node) + qualifier
+                )
                 code += f"{qualifier}{declaration}{register};\n"
                 continue
 
@@ -5072,7 +5117,8 @@ class HLSLCodeGen(
                     node.initial_value, node.var_type
                 )
                 declaration += f" = {initializer}"
-            code += f"{qualifier}{declaration}{register};\n"
+            image_format_prefix = self.storage_image_format_prefix(mapped_type, node)
+            code += f"{image_format_prefix}{qualifier}{declaration}{register};\n"
             if (
                 mapped_type == "SamplerState"
                 and var_name in self.global_mixed_sampler_aliases
@@ -5474,6 +5520,7 @@ class HLSLCodeGen(
                 getattr(function, "parameters", None) or [],
                 getattr(prototype, "parameters", None) or [],
             ):
+                self.storage_parameter_texels.copy_parameter(original, copied)
                 view = self.hlsl_view_storage_array_parameters.get(id(original))
                 if view is not None and view[0] is original:
                     self.hlsl_view_storage_array_parameters[id(copied)] = (
@@ -5604,7 +5651,7 @@ class HLSLCodeGen(
             node
             for node in self.walk_ast(root)
             if isinstance(node, CooperativeMatrixOpNode)
-            and node.operation in {"fill", "load", "store"}
+            and node.operation in {"fill", "diagonal", "load", "store"}
         ]
 
     def hlsl_software_subgroup_bind_lane_local_matrix_functions(self, ast, nodes):
@@ -8739,6 +8786,7 @@ class HLSLCodeGen(
             self.required_hlsl_software_subgroup_helpers
             or self.required_hlsl_cooperative_matrix_mma
             or self.required_hlsl_cooperative_matrix_fragment_offset
+            or self.required_hlsl_cooperative_matrix_diagonals
             or self.hlsl_software_subgroup_invocation_variable is not None
         ):
             return ""
@@ -8846,6 +8894,7 @@ class HLSLCodeGen(
             code += self.generate_hlsl_cooperative_matrix_mma_helper()
         if self.required_hlsl_cooperative_matrix_fragment_offset:
             code += self.generate_hlsl_cooperative_matrix_fragment_offset_helper()
+        code += generate_hlsl_cooperative_matrix_diagonal_helpers(self)
         return code
 
     def prepare_hlsl_physical_subgroup_id_helper_names(self, functions):
@@ -10808,7 +10857,9 @@ complex64_t __crossgl_complex64_wave_shuffle_and_fill_up(
             for member in getattr(node, "members", [])
             if not self.hlsl_static_struct_member(member)
         ]
-        if not members:
+        if not members and not self.hlsl_union_attribute(
+            node, EMPTY_STREAM_VERTEX_ATTRIBUTE
+        ):
             code += "    int _crossgl_empty;\n"
         default_member_semantics = self.hlsl_default_struct_member_semantics(node)
         for member in members:
@@ -13276,7 +13327,7 @@ float4x4 __crossgl_inverse_float4_4(float4x4 m) {
             ):
                 packoffsets = self.hlsl_block_packoffsets(ast, node)
                 if isinstance(packoffsets, HlslRegisterBlockPlan):
-                    code += self.hlsl_glsl_block_register_buffer(
+                    block = self.hlsl_glsl_block_register_buffer(
                         ast,
                         node,
                         packoffsets.layout,
@@ -13284,14 +13335,17 @@ float4x4 __crossgl_inverse_float4_4(float4x4 m) {
                         buffer_keyword,
                         register,
                     )
-                    continue
-                code += f"{buffer_keyword} {node.name}{register} {{\n"
-                for member in getattr(node, "members", []) or []:
-                    declaration = self.generate_hlsl_cbuffer_member_declaration(
-                        member, packoffsets.get(getattr(member, "name", None))
-                    )
-                    code += f"    {declaration};\n"
-                code += "};\n"
+                else:
+                    block = f"{buffer_keyword} {node.name}{register} {{\n"
+                    for member in getattr(node, "members", []) or []:
+                        declaration = self.generate_hlsl_cbuffer_member_declaration(
+                            member, packoffsets.get(getattr(member, "name", None))
+                        )
+                        block += f"    {declaration};\n"
+                    block += "};\n"
+                if is_push_constant(node):
+                    block = hlsl_push_constant_block(self, ast, node, block)
+                code += block
         return code
 
     def hlsl_block_packoffsets(self, ast, node):
@@ -13512,6 +13566,11 @@ float4x4 __crossgl_inverse_float4_4(float4x4 m) {
         return None
 
     def generate_compute_numthreads(self, execution_config=None):
+        require_fixed_workgroup_size(
+            execution_config,
+            "HLSL",
+            "Direct3D has no specialization constants, and numthreads takes literals",
+        )
         x, y, z = self.validate_hlsl_compute_workgroup_size(
             compute_local_size(execution_config)
         )
@@ -14390,12 +14449,20 @@ float4x4 __crossgl_inverse_float4_4(float4x4 m) {
                     f"{helper_name}({group_index_name});",
                 )
         elif effective_shader_type == "vertex":
+            explicit_stage_builtins = self.explicit_hlsl_vertex_builtin_parameters(
+                param_list
+            )
             for (
                 name,
                 param_type,
                 semantic,
             ) in self.required_hlsl_vertex_builtin_parameters(func):
                 if not name or name in param_names:
+                    continue
+                # An input that already carries the system value delivers it; a second one would overlap it.
+                existing = explicit_stage_builtins.get(semantic.lower())
+                if existing:
+                    self.current_identifier_aliases[name] = existing
                     continue
                 declaration = f"{param_type} {name}"
                 if semantic:
@@ -20290,6 +20357,34 @@ float4x4 __crossgl_inverse_float4_4(float4x4 m) {
                     "root_kind": "local",
                 }
             return None
+
+        if isinstance(expression, ArrayAccessNode):
+            row = self.hlsl_private_pointer_array_row(
+                expression,
+                self.current_hlsl_private_pointer_base_names,
+                local_extents,
+                self.function_private_pointer_local_backing_types.get(
+                    self.current_function_name, {}
+                ),
+                self.literal_int_constants,
+            )
+            if row is None:
+                return None
+            if any(
+                self.hlsl_private_pointer_expression_has_side_effects(index)
+                for index in row[3]
+            ):
+                raise DirectXPrivatePointerParameterError(
+                    "DirectX cannot emit a side-effecting private array row index",
+                    function_name=self.current_function_name,
+                    reason="side-effecting-view-offset",
+                    source_location=getattr(expression, "source_location", None),
+                )
+            return {
+                "backing": self.generate_expression(expression),
+                "offset": "0",
+                "root_kind": "local",
+            }
 
         if isinstance(expression, UnaryOpNode) and expression.op == "&":
             operand = expression.operand
@@ -27456,6 +27551,8 @@ float4x4 __crossgl_inverse_float4_4(float4x4 m) {
             return self.generate_hlsl_cooperative_matrix_mma(expr)
         if operation == "fill":
             return self.generate_hlsl_cooperative_matrix_fill(expr)
+        if operation == "diagonal":
+            return generate_hlsl_cooperative_matrix_diagonal(self, expr)
         if operation in {"load", "store"} and self.software_subgroup_width == 32:
             return self.generate_hlsl_cooperative_matrix_transfer(expr)
         if operation in {"load", "store"}:
@@ -31970,6 +32067,36 @@ float4x4 __crossgl_inverse_float4_4(float4x4 m) {
             )
         return rendered
 
+    def hlsl_resource_pointer_length(self, pointer_expr):
+        """``length()`` of a helper's ``buffer T*`` parameter: its buffer's elements from the offset on."""
+        # A buffer parameter is passed as its buffer plus an element offset, so its
+        # length is that buffer's element count less the offset, not a member call.
+        if not isinstance(pointer_expr, (IdentifierNode, VariableNode)):
+            # An element such as data[3] is a value, not a view, even though its
+            # binding is the view moved to that element.
+            return None
+        binding = self.hlsl_resource_pointer_binding(pointer_expr)
+        if (
+            binding is None
+            or binding.get("kind") == "workgroup-pointer"
+            or "pointer_reinterpretation" in binding
+            or "byte_offset" in binding
+            or not binding.get("root")
+        ):
+            return None
+        resource_type = binding.get("resource_type")
+        count = self.hlsl_buffer_length.element_count(
+            binding["root"],
+            self.hlsl_resource_type_name(resource_type),
+            self.map_type(resource_type) if resource_type else None,
+        )
+        if count is None:
+            return None
+        offset = binding.get("offset")
+        if offset is None or str(offset) in {"0", "0u"}:
+            return f"int({count})"
+        return f"(int({count}) - int({offset}))"
+
     def generate_glsl_buffer_block_length_call(self, func_expr, args):
         """``block.member.length()`` for a GLSL buffer block lowered to a byte-address buffer."""
         if not (
@@ -31981,12 +32108,16 @@ float4x4 __crossgl_inverse_float4_4(float4x4 m) {
         object_expr = getattr(
             func_expr, "object_expr", getattr(func_expr, "object", None)
         )
-        if isinstance(object_expr, (IdentifierNode, VariableNode)):
+        if isinstance(object_expr, (IdentifierNode, VariableNode, ArrayAccessNode)):
             # 'buffer T* name' is a runtime-sized element view of a structured
-            # buffer: its length() is GetDimensions' element count.
+            # buffer, and 'bufs[i]' an element of a resource array: their
+            # length() is GetDimensions' element count.
             resource_type = self.hlsl_buffer_helper_resource_type(object_expr)
             if resource_type is not None:
                 return f"int({self.hlsl_buffer_element_count(object_expr)})"
+            pointer_length = self.hlsl_resource_pointer_length(object_expr)
+            if pointer_length is not None:
+                return pointer_length
         access = self.glsl_buffer_block_member_access(
             getattr(func_expr, "object_expr", getattr(func_expr, "object", None))
         )
@@ -32143,11 +32274,17 @@ float4x4 __crossgl_inverse_float4_4(float4x4 m) {
 
     def hlsl_byteaddress_interlocked_uint_input_matches(self, expr):
         kind = self.scalar_expression_kind(expr)
-        if kind is None or kind == "uint":
+        if kind == "uint":
             return True
         if kind == "int":
             value = self.literal_int_value(expr, self.literal_int_constants)
             return value is not None and value >= 0
+        if kind is None:
+            # A value whose numeric kind is unknown passes only when its type
+            # cannot be resolved at all. A resolvable non-uint scalar such as
+            # bool or int64_t is refused like float: DXC would otherwise
+            # silently convert the bool or narrow the 64-bit value to uint.
+            return self.type_name_string(self.expression_result_type(expr)) is None
         return False
 
     def validate_hlsl_byteaddress_interlocked_uint_input(
@@ -32157,15 +32294,22 @@ float4x4 __crossgl_inverse_float4_4(float4x4 m) {
             return
         if self.hlsl_byteaddress_interlocked_uint_input_matches(args[index]):
             return
-        kind = self.scalar_expression_kind(args[index]) or "unknown"
+        kind = (
+            self.scalar_expression_kind(args[index])
+            or self.type_name_string(self.expression_result_type(args[index]))
+            or "unknown"
+        )
         raise ValueError(
             f"{self.hlsl_byteaddress_interlocked_error_prefix(method_name)} "
             f"{role} argument must be scalar uint, got {kind}"
         )
 
-    def validate_hlsl_byteaddress_interlocked_original(self, method_name, original_arg):
+    def validate_hlsl_byteaddress_interlocked_original(
+        self, method_name, original_arg, signed=False
+    ):
         original_kind = self.scalar_expression_kind(original_arg)
-        if original_kind != "uint":
+        expected = "int or uint" if signed else "uint"
+        if original_kind != "uint" and not (signed and original_kind == "int"):
             original_type = (
                 self.type_name_string(self.expression_result_type(original_arg))
                 or original_kind
@@ -32173,12 +32317,12 @@ float4x4 __crossgl_inverse_float4_4(float4x4 m) {
             )
             raise ValueError(
                 f"{self.hlsl_byteaddress_interlocked_error_prefix(method_name)} "
-                f"original argument must be scalar uint, got {original_type}"
+                f"original argument must be scalar {expected}, got {original_type}"
             )
         if not self.hlsl_typed_buffer_atomic_original_is_lvalue(original_arg):
             raise ValueError(
                 f"{self.hlsl_byteaddress_interlocked_error_prefix(method_name)} "
-                "original argument must be an assignable scalar uint target"
+                f"original argument must be an assignable scalar {expected} target"
             )
 
     def generate_hlsl_byteaddress_interlocked_member_call(self, func_expr, args):
@@ -32232,18 +32376,30 @@ float4x4 __crossgl_inverse_float4_4(float4x4 m) {
         self.validate_hlsl_byteaddress_interlocked_uint_input(
             method_name, args, 0, "address"
         )
-        for index, role in value_roles:
-            self.validate_hlsl_byteaddress_interlocked_uint_input(
-                method_name, args, index, role
-            )
+        # An int value selects the signed IMin/IMax operation.  A non-negative
+        # int literal still passes as uint: DXC reads InterlockedMax(0, 5) as
+        # the unsigned UMax, so it cannot take an int original value.
+        signed = (
+            method_name in {"InterlockedMin", "InterlockedMax"}
+            and self.scalar_expression_kind(args[1]) == "int"
+            and not self.hlsl_byteaddress_interlocked_uint_input_matches(args[1])
+        )
+        if not signed:
+            for index, role in value_roles:
+                self.validate_hlsl_byteaddress_interlocked_uint_input(
+                    method_name, args, index, role
+                )
         if original_index is not None and len(args) > original_index:
             self.validate_hlsl_byteaddress_interlocked_original(
-                method_name, args[original_index]
+                method_name, args[original_index], signed
             )
 
         receiver = self.generate_expression(object_expr)
         rendered_args = [
-            self.generate_expression_with_expected(arg, "uint") for arg in args
+            self.generate_expression_with_expected(
+                arg, "int" if signed and index == 1 else "uint"
+            )
+            for index, arg in enumerate(args)
         ]
         return f"{receiver}.{method_name}({', '.join(rendered_args)})"
 
@@ -36400,8 +36556,10 @@ float4x4 __crossgl_inverse_float4_4(float4x4 m) {
             )
 
     # System values DXIL requires to be uint; Vulkan HLSL and GLSL (gl_Layer, gl_PrimitiveID) also take int.
+    # GLSL declares the stencil export gl_FragStencilRefARB as int (GL_ARB_shader_stencil_export).
     HLSL_UNSIGNED_SYSTEM_VALUES = frozenset(
         {
+            "SV_STENCILREF",
             "SV_RENDERTARGETARRAYINDEX",
             "SV_VIEWPORTARRAYINDEX",
             "SV_PRIMITIVEID",
@@ -41477,6 +41635,24 @@ float4x4 __crossgl_inverse_float4_4(float4x4 m) {
             parameter for parameter in builtin_parameters if parameter[0] in used_names
         ]
 
+    def explicit_hlsl_vertex_builtin_parameters(self, parameters):
+        """Lower-case system value -> the vertex input that already carries it."""
+        stage_parameters = {}
+        system_values = ("SV_VertexID", "SV_InstanceID", "SV_ViewID")
+        for parameter in parameters or []:
+            name = getattr(parameter, "name", None)
+            semantic = self.hlsl_canonical_semantic(self.semantic_from_node(parameter))
+            if name and semantic:
+                stage_parameters.setdefault(str(semantic).lower(), name)
+                continue
+            for system_value in system_values:
+                member = self.hlsl_struct_member_with_semantic(parameter, system_value)
+                if name and member is not None:
+                    stage_parameters.setdefault(
+                        system_value.lower(), f"{name}.{member}"
+                    )
+        return stage_parameters
+
     def explicit_hlsl_fragment_builtin_parameters(self, parameters):
         stage_parameters = {}
         for parameter in parameters or []:
@@ -43527,7 +43703,14 @@ float4x4 __crossgl_inverse_float4_4(float4x4 m) {
                             scalar_parameters[call["callee"]].add(parameter_name)
                             changed = True
         self.function_private_pointer_scalar_parameters = scalar_parameters
-        aliased = hlsl_aliased_scalar_view(view_calls, scalar_parameters)
+        aliased = hlsl_aliased_scalar_view(
+            view_calls, scalar_parameters
+        ) or aliased_row_view(view_calls)
+        if aliased is None:
+            aliased = hlsl_aliased_writable_view(
+                view_calls,
+                hlsl_writable_pointer_parameters(self, pointer_parameters),
+            )
         if aliased is not None:
             call, first, second, root = aliased
             raise DirectXPrivatePointerParameterError(
@@ -44250,6 +44433,21 @@ float4x4 __crossgl_inverse_float4_4(float4x4 m) {
             )
         return None
 
+    def hlsl_private_pointer_array_row(
+        self, expression, parameter_names, local_extents, local_types, constants
+    ):
+        """The row of a fixed multidimensional local array ``expression`` selects, or None."""
+
+        def shape_of(name):
+            if name in parameter_names or name not in local_extents:
+                return None
+            return array_row_shape(
+                (local_types or {}).get(name),
+                lambda size: self.literal_int_value(size, constants),
+            )
+
+        return array_row_view(expression, shape_of)
+
     def hlsl_private_pointer_static_binding(
         self,
         expression,
@@ -44316,6 +44514,24 @@ float4x4 __crossgl_inverse_float4_4(float4x4 m) {
                     "side_effecting": False,
                 }
             return None
+        if isinstance(expression, ArrayAccessNode):
+            row = self.hlsl_private_pointer_array_row(
+                expression, parameter_names, local_extents, local_types, constants
+            )
+            if row is None:
+                return None
+            root_name, extent, _element_type, indices = row
+            return {
+                "root_kind": "local",
+                "root": root_name,
+                "extent": extent,
+                "offset": (0, 0),
+                "side_effecting": any(
+                    self.hlsl_private_pointer_expression_has_side_effects(index)
+                    for index in indices
+                ),
+                "row_view": True,
+            }
         if isinstance(expression, UnaryOpNode) and expression.op == "&":
             operand = expression.operand
             if isinstance(operand, (IdentifierNode, VariableNode)):
@@ -47767,7 +47983,8 @@ float4x4 __crossgl_inverse_float4_4(float4x4 m) {
         image_type = self.resource_base_type(image_type)
         if "<" not in image_type or ">" not in image_type:
             return None
-        return image_type.split("<", 1)[1].split(">", 1)[0].strip()
+        # A unorm or snorm element has the shape of its float type.
+        return strip_texel_modifier(image_type.split("<", 1)[1].split(">", 1)[0])
 
     def hlsl_storage_image_component_kind(self, image_type):
         component_type = self.hlsl_storage_image_component_type(image_type)
@@ -53506,7 +53723,16 @@ float4x4 __crossgl_inverse_float4_4(float4x4 m) {
             self.explicit_resource_register_space(node),
         )
 
+    def storage_image_format_prefix(self, mapped_type, node):
+        if not self.is_hlsl_rw_texture_type(mapped_type):
+            return ""
+        image_format = explicit_image_format(node, self.attribute_value_to_string)
+        return dxc_vulkan_image_format_prefix(image_format)
+
     def resource_memory_qualifier(self, mapped_type, node):
+        unrepresentable = hlsl_unrepresentable_memory_qualifier(node)
+        if unrepresentable is not None:
+            return self.refuse_lowering(unrepresentable)
         if not (
             self.is_hlsl_rw_texture_type(mapped_type)
             or str(mapped_type).startswith("RWBuffer")
@@ -53514,7 +53740,9 @@ float4x4 __crossgl_inverse_float4_4(float4x4 m) {
         ):
             return ""
 
-        qualifiers = {str(q).lower() for q in getattr(node, "qualifiers", []) or []}
+        qualifiers = {
+            memory_qualifier_name(q) for q in getattr(node, "qualifiers", []) or []
+        }
         attributes = {
             str(getattr(attr, "name", "")).lower()
             for attr in getattr(node, "attributes", []) or []
@@ -53991,6 +54219,31 @@ float4x4 __crossgl_inverse_float4_4(float4x4 m) {
 
         return self.map_image_base_type_with_format(vtype_str, node)
 
+    def storage_parameter_type(self, node):
+        """The HLSL type of the storage images a parameter receives, or ``None``."""
+        if node is None or texel_attribute(node) is not None:
+            return None
+        try:
+            return self.storage_parameter_texels.parameter_type(
+                node,
+                lambda declaration: self.map_image_base_type_with_format(
+                    declaration.vtype, declaration
+                ),
+            )
+        except ValueError as error:
+            return self.refuse_lowering(f"DirectX {error}", None)
+
+    def declared_storage_texel_type(self, node, image_type, explicit_format):
+        """The HLSL texel type a storage image's ``@texel`` declares, or ``None``."""
+        if node is None:
+            return None
+        try:
+            return declared_texel_type(
+                node, image_type, explicit_format, self.attribute_value_to_string
+            )
+        except ValueError as error:
+            return self.refuse_lowering(f"DirectX {error}", None)
+
     def map_image_base_type_with_format(self, vtype, node=None):
         base_type = self.resource_base_type(vtype)
         explicit_format = (
@@ -53998,6 +54251,10 @@ float4x4 __crossgl_inverse_float4_4(float4x4 m) {
             if node is not None
             else None
         )
+        if explicit_format is None:
+            parameter_type = self.storage_parameter_type(node)
+            if parameter_type is not None:
+                return parameter_type
         component_type = self.scalar_image_format_components().get(
             explicit_format
         ) or self.vector_image_format_components().get(explicit_format)
@@ -54031,8 +54288,16 @@ float4x4 __crossgl_inverse_float4_4(float4x4 m) {
             "RWTexture3D": "RWTexture3D",
         }
         texture_type = texture_types.get(base_type)
+        declared_texel = (
+            self.declared_storage_texel_type(node, base_type, explicit_format)
+            if texture_type
+            else None
+        )
         if component_type and texture_type:
-            mapped_type = f"{texture_type}<{component_type}>"
+            texel_type = normalized_texel_type(explicit_format, component_type)
+            mapped_type = f"{texture_type}<{texel_type}>"
+        elif declared_texel:
+            mapped_type = f"{texture_type}<{declared_texel}>"
         elif texture_type and base_type.startswith(("iimage", "uimage")):
             # An integer storage image without a format is as wide as its texels,
             # except as an image atomic's target, which needs a scalar element.
@@ -54172,6 +54437,9 @@ float4x4 __crossgl_inverse_float4_4(float4x4 m) {
             target_type_key="hlsl_type",
             unsupported_type_message=(
                 "type is not supported by ByteAddressBuffer lowering"
+            ),
+            component_refusal=lambda info: hlsl_byteaddress_component_refusal(
+                self, info
             ),
         )
         self.record_unsupported_glsl_buffer_block_layout_failures(
@@ -54368,6 +54636,9 @@ float4x4 __crossgl_inverse_float4_4(float4x4 m) {
                 f"x{access['matrix_rows']}"
             )
             return f"transpose({transposed_type}({', '.join(columns)}))"
+
+        if hlsl_byteaddress_is_typed_access(access):
+            return hlsl_byteaddress_typed_load(self, buffer_name, offset, access)
 
         if access["component_type"] == "bool" and access["components"] > 1:
             values = []
@@ -54584,6 +54855,10 @@ float4x4 __crossgl_inverse_float4_4(float4x4 m) {
         if access.get("matrix_columns"):
             return self.hlsl_byteaddress_matrix_store(
                 buffer_name, offset, value, access
+            )
+        if hlsl_byteaddress_is_typed_access(access):
+            return hlsl_byteaddress_typed_store(
+                self, buffer_name, offset, value, access
             )
         if access["component_type"] == "bool" and access["components"] > 1:
             return self.hlsl_byteaddress_bool_vector_store(

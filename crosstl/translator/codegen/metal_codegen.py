@@ -34,6 +34,7 @@ from ..ast import (
     MatchNode,
     MemberAccessNode,
     MeshOpNode,
+    NamedType,
     PointerAccessNode,
     PointerReinterpretNode,
     PointerType,
@@ -106,6 +107,7 @@ from .array_utils import (
     split_array_type_suffix,
 )
 from .assignment_values import assignment_value_expression
+from .ast_value_walk import iter_ast_values
 from .barrier_peephole import merge_adjacent_metal_barriers
 from .bitfield_builtins import BITFIELD_ARITIES, metal_bitfield_call
 from .boolean_mix import boolean_mix_selector, metal_boolean_mix
@@ -113,7 +115,7 @@ from .buffer_block_diagnostics import (
     BufferBlockUnsupportedError,
     record_unsupported_layout_failures,
 )
-from .buffer_length import BufferLengthUnsupportedError
+from .buffer_length import COUNTED_BUFFERS, BufferLengthUnsupportedError
 from .buffer_member_layout import member_is_packed
 from .builtin_result_types import (
     C_FAMILY,
@@ -380,11 +382,17 @@ from .metal_array_copies import (
 from .metal_atomic_addresses import metal_vector_component_address
 from .metal_bit_scans import emit_metal_bit_scan_helpers, metal_bit_scan_call
 from .metal_buffer_arrays import expand_entry_buffer_array
-from .metal_buffer_component_stores import metal_buffer_component_store
+from .metal_buffer_component_stores import (
+    metal_buffer_component_store,
+    metal_buffer_component_type,
+    metal_glsl_buffer_component_refusal,
+)
 from .metal_colour_attachment_inputs import is_metal_colour_attachment_input_parameter
+from .metal_combined_samplers import bind_combined_samplers
 from .metal_comparison_signs import metal_sign_matched_comparison_operands
 from .metal_debug_printf import metal_debug_printf_statement, uses_debug_printf
 from .metal_double_refusal import refuse_metal_double_values
+from .metal_draw_base_indices import offset_metal_draw_base_indices
 from .metal_fragment_outputs import metal_fragment_output_color_semantic
 from .metal_hlsl_functions import MetalHlslFunctionMixin
 from .metal_hlsl_matrix import (
@@ -408,6 +416,19 @@ from .metal_narrow_vectors import MetalNarrowVectorMixin
 from .metal_nested_stage_io import collect_metal_nested_stage_io_member_lowerings
 from .metal_ray_flags import metal_trace_ray_flag_statements
 from .metal_refusals import metal_refusals
+from .metal_restrict import metal_restrict_suffix
+from .metal_signed_builtins import (
+    collect_metal_signed_builtin_members,
+    metal_signed_builtin_parameter_name,
+    metal_signed_member_assignment,
+)
+from .metal_specialization_constants import (
+    block_member_array_types,
+    flattened_stage_io_array_types,
+    metal_function_constant_type_refusal,
+    refuse_specialization_sized_arrays,
+    render_metal_specialization_constant,
+)
 from .metal_stage_input_builtins import split_metal_stage_input_builtins
 from .metal_stage_refusals import refuse_metal_stages
 from .metal_texel_buffers import (
@@ -417,6 +438,7 @@ from .metal_texel_buffers import (
     texel_buffer_component_type,
 )
 from .metal_varyings import is_metal_varying_builtin, metal_varying_attribute
+from .metal_vertex_input_builtins import refuse_unbound_metal_vertex_inputs
 from .metal_wave_extended import (
     emit_metal_wave_extension_helpers,
     metal_subgroup_lane_mask_expression,
@@ -1162,6 +1184,8 @@ class MetalCodeGen(
         self.metal_fragment_entry_output_struct_names = set()
         self.metal_stage_io_struct_names = set()
         self.metal_stage_io_member_lowerings = {}
+        self.metal_signed_builtin_members = {}
+        self.metal_signed_member_raw_reads = set()
         self.type_mapping = {
             # Scalar Types
             "void": "void",
@@ -1511,6 +1535,13 @@ class MetalCodeGen(
             "SV_InstanceId": "instance_id",
             "sv_instance_id": "instance_id",
             "sv_instanceid": "instance_id",
+            # GLSL 4.60 / GL_ARB_shader_draw_parameters; SV_Start*Location is HLSL SM 6.8.
+            "gl_BaseVertex": "base_vertex",
+            "gl_BaseVertexARB": "base_vertex",
+            "SV_StartVertexLocation": "base_vertex",
+            "gl_BaseInstance": "base_instance",
+            "gl_BaseInstanceARB": "base_instance",
+            "SV_StartInstanceLocation": "base_instance",
             "gl_IsFrontFace": "front_facing",
             "SV_IsFrontFace": "front_facing",
             "SV_IsFrontFacing": "front_facing",
@@ -1521,6 +1552,9 @@ class MetalCodeGen(
             "SV_PrimitiveId": "primitive_id",
             "sv_primitive_id": "primitive_id",
             "sv_primitiveid": "primitive_id",
+            # A mesh primitive's cull flag: a member of the mesh<> primitive structure.
+            "gl_CullPrimitiveEXT": "primitive_culled",
+            "SV_CullPrimitive": "primitive_culled",
             # The classic vertex semantics keep the location every target gives them.
             **{
                 semantic: f"attribute({location})"
@@ -1572,6 +1606,8 @@ class MetalCodeGen(
             "gl_FragCoord": "position",
             "gl_BaryCoordEXT": "barycentric_coord",
             "gl_BaryCoordNoPerspEXT": "barycentric_coord",
+            "gl_BaryCoordNV": "barycentric_coord",
+            "gl_BaryCoordNoPerspNV": "barycentric_coord",
             "gl_FrontFacing": "front_facing",
             "gl_PointCoord": "point_coord",
             "gl_SampleID": "sample_id",
@@ -2043,6 +2079,7 @@ class MetalCodeGen(
         )
         ast = materialize_structured_buffer_counters(ast, self.refuse_lowering)
         ast = canonicalize_separate_textures(ast, "Metal", depth_for_compares=True)
+        ast = bind_combined_samplers(ast)
         validate_pointer_reinterpretation_target(ast, "metal")
         validate_recursion_free(ast, "metal")
         self.validate_supported_stage_types(ast, target_stage)
@@ -2051,7 +2088,9 @@ class MetalCodeGen(
         ast = rename_msl_library_functions(ast)
         ast = rename_metal_namespace_names(ast)
         ast = rename_metal_keyword_parameters(ast)
+        refuse_unbound_metal_vertex_inputs(ast, self)
         ast = split_metal_stage_input_builtins(ast, self)
+        ast = offset_metal_draw_base_indices(ast, self)
         self.metal_type_aliases = self.collect_metal_type_aliases(ast)
         self.metal_fenced_image_names = self.collect_metal_read_after_write_images(ast)
         self.metal_program_identifier_names = (
@@ -2093,6 +2132,8 @@ class MetalCodeGen(
         self.metal_fragment_entry_output_struct_names = set()
         self.metal_stage_io_struct_names = set()
         self.metal_stage_io_member_lowerings = {}
+        self.metal_signed_builtin_members = {}
+        self.metal_signed_member_raw_reads = set()
         self.hlsl_program_constant_global_ids = set()
         self.cbuffer_variables = list(getattr(ast, "cbuffers", []) or [])
         hlsl_program_constants = self.synthetic_hlsl_program_constants_cbuffer(ast)
@@ -2459,6 +2500,7 @@ class MetalCodeGen(
             unsupported_type_message=(
                 "type is not supported by Metal pointer/offset lowering"
             ),
+            component_refusal=metal_glsl_buffer_component_refusal,
         )
         self.record_metal_glsl_buffer_block_layout_failures(
             global_vars,
@@ -2469,6 +2511,21 @@ class MetalCodeGen(
         self.lowered_glsl_buffer_block_struct_names = {
             block["type_name"] for block in self.lowered_glsl_buffer_blocks.values()
         }
+        refuse_specialization_sized_arrays(
+            ast,
+            lambda node: self.metal_specialization_constant_id(node) is not None,
+            self.refuse_lowering,
+            flattened_stage_io_array_types(
+                structs,
+                self.metal_stage_io_struct_names,
+                self.metal_stage_io_member_array_info,
+            )
+            + block_member_array_types(
+                self.cbuffer_variables,
+                structs,
+                self.lowered_glsl_buffer_block_struct_names,
+            ),
+        )
         self.unsupported_glsl_buffer_block_struct_names = set(
             self.glsl_buffer_block_struct_lowering_failures
         )
@@ -2602,6 +2659,9 @@ class MetalCodeGen(
         )
         self.metal_stage_io_member_lowerings = (
             self.collect_metal_stage_io_member_lowerings(structs)
+        )
+        self.metal_signed_builtin_members = collect_metal_signed_builtin_members(
+            self, structs
         )
         code = "\n"
         code += source_license_comments(ast, "metal")
@@ -3426,22 +3486,33 @@ class MetalCodeGen(
 
             const_type = getattr(node, "const_type", getattr(node, "vtype", "float"))
             value = getattr(node, "value", None)
-            value_code = self.generate_constant_expression(value)
+            value_code = self.generate_constant_expression(
+                value,
+                expected_type=(
+                    const_type if isinstance(value, ArrayLiteralNode) else None
+                ),
+            )
             mapped_type = self.map_type(const_type)
             specialization_id = self.metal_specialization_constant_id(node)
-            if specialization_id is not None:
-                code += (
-                    "/* CrossGL fallback: Metal source output cannot preserve "
-                    f"GLSL specialization constant id {specialization_id} for "
-                    f"'{name}'; using the default literal. */\n"
-                )
-            if specialization_id is not None and mapped_type == "double":
-                code += (
-                    "/* CrossGL fallback: Metal does not support double "
-                    f"specialization constant '{name}'; lowered to float. */\n"
-                )
-                mapped_type = "float"
             declaration = format_c_style_array_declaration(mapped_type, name)
+            if specialization_id is not None:
+                refusal = metal_function_constant_type_refusal(
+                    name,
+                    self.type_name_string(const_type),
+                    mapped_type,
+                    self.is_metal_function_constant_value_type,
+                )
+                if refusal is None:
+                    code += render_metal_specialization_constant(
+                        self.metal_unused_declaration_qualifier("constant"),
+                        mapped_type,
+                        declaration,
+                        name,
+                        specialization_id,
+                        value_code,
+                    )
+                    continue
+                self.refuse_lowering(refusal)
             if mapped_type == "sampler":
                 # Program-scope fixed sampler state; texture calls take it as
                 # their explicit sampler argument.
@@ -3961,7 +4032,7 @@ class MetalCodeGen(
         semantic = self.semantic_from_node(node)
         if semantic is None:
             return None
-        if str(semantic).lower() == "gl_barycoordnoperspext":
+        if str(semantic).lower() in {"gl_barycoordnoperspext", "gl_barycoordnoperspnv"}:
             return "center_no_perspective"
         return None
 
@@ -4003,8 +4074,12 @@ class MetalCodeGen(
             return f"array<{resource_type}, {array_size}> {name}"
         return f"array<{resource_type}> {name}"
 
-    def generate_constant_expression(self, expr):
-        value_code = self.generate_expression(expr)
+    def generate_constant_expression(self, expr, expected_type=None):
+        if expected_type is None:
+            value_code = self.generate_expression(expr)
+        else:
+            # An initializer list gets its declared array type, as a local's does.
+            value_code = self.generate_expression_with_expected(expr, expected_type)
         if value_code == "True":
             return "true"
         if value_code == "False":
@@ -4900,6 +4975,8 @@ class MetalCodeGen(
             if self.metal_native_narrow_bitcast_storage_type(raw_type) is not None:
                 member_type = self.metal_struct_storage_type(raw_type)
         member_type = self.metal_packed_storage_type(member, member_type)
+        if member.name in self.metal_signed_builtin_members.get(struct_name, ()):
+            member_type = "uint"
         dependencies.update(self.metal_struct_type_dependencies(member_type))
         return (
             f"    {member_type} {member.name}{abi_attr}{semantic_attr}"
@@ -7148,6 +7225,8 @@ class MetalCodeGen(
         expected_types = {
             "vertex_id": "uint",
             "instance_id": "uint",
+            "base_vertex": "uint",
+            "base_instance": "uint",
             "primitive_id": "uint",
             "front_facing": "bool",
             "render_target_array_index": "uint",
@@ -7271,20 +7350,14 @@ class MetalCodeGen(
         stage_name,
         reserved_names=None,
     ):
-        if stage_name != "vertex":
-            return None
         metal_semantic = self.canonical_metal_semantic(
             self.semantic_from_node(parameter)
         )
-        if metal_semantic not in {"vertex_id", "instance_id"}:
+        base_name = metal_signed_builtin_parameter_name(
+            stage_name, metal_semantic, mapped_param_type
+        )
+        if base_name is None:
             return None
-        if mapped_param_type != "int":
-            return None
-
-        base_name = {
-            "vertex_id": "_crossglVertexID",
-            "instance_id": "_crossglInstanceID",
-        }[metal_semantic]
         return {
             "type": "uint",
             "name": self.unique_metal_generated_name(base_name, reserved_names or ()),
@@ -7564,7 +7637,12 @@ class MetalCodeGen(
         }
 
     def validate_struct_member_semantic_types(self, struct_node):
+        signed_members = self.metal_signed_builtin_members.get(
+            getattr(struct_node, "name", None), ()
+        )
         for member in getattr(struct_node, "members", []) or []:
+            if getattr(member, "name", None) in signed_members:
+                continue
             semantic = self.semantic_from_node(member)
             metal_semantic = self.canonical_metal_semantic(semantic)
             expected_type = self.struct_member_builtin_semantic_type(metal_semantic)
@@ -7871,6 +7949,7 @@ class MetalCodeGen(
                     buffer_name,
                     array_size,
                     address_space,
+                    buffer_variable,
                 )
                 resource_params.append(f"{declaration} [[buffer({i})]]")
         if self.texture_variables:
@@ -8233,7 +8312,11 @@ class MetalCodeGen(
             if buffer_name:
                 resource_params.append(
                     self.format_metal_buffer_resource_parameter(
-                        buffer_type, buffer_name, array_size, address_space
+                        buffer_type,
+                        buffer_name,
+                        array_size,
+                        address_space,
+                        buffer_variable,
                     )
                 )
         for (
@@ -8294,7 +8377,11 @@ class MetalCodeGen(
         name = getattr(cbuffer, "name", "constants")
         if not name:
             return "constants"
-        return name[:1].lower() + name[1:]
+        name = name[:1].lower() + name[1:]
+        # ``Kernel`` would become the keyword ``kernel``, which MSL rejects as a parameter name.
+        if name in self.METAL_RESERVED_LOCAL_IDENTIFIERS:
+            return f"{name}_"
+        return name
 
     def collect_cbuffer_parameter_names(self, cbuffers, reserved_names=None):
         parameter_names = {}
@@ -9024,6 +9111,12 @@ class MetalCodeGen(
         fixed local array passed to a ``thread T*`` helper must retain the helper's
         ``char``/``uchar``/``short``/``ushort`` pointee width.
         """
+        pointee = self.local_variable_crossgl_pointer_pointee(node)
+        if pointee is not None:
+            # A CrossGL `ptr<T>` local is a pointer into the address space
+            # the qualifier prefix supplies, not a `ptr<T>` value: Metal has
+            # no such type, so it is declared as a C-style pointer.
+            return self.metal_crossgl_pointer_local_type(node, pointee)
         mapped_type = self.map_type(declared_type)
         aggregate_type, array_suffix = split_array_type_suffix(mapped_type)
         if aggregate_type in self.structs_by_name and (
@@ -9060,11 +9153,110 @@ class MetalCodeGen(
             else None
         )
 
+    def local_variable_crossgl_pointer_pointee(self, node):
+        """The pointee type node of a CrossGL ``ptr<T>`` local, else ``None``.
+
+        The CrossGL parser represents ``ptr<T>`` as a ``NamedType``, not a
+        ``PointerType``, so without this the address-space alias machinery
+        below misses it and Metal output copies ``ptr<T>`` unchanged, which
+        the Metal compiler rejects as an undeclared identifier.
+        """
+        raw_type = self.local_variable_type_node(node)
+        if (
+            isinstance(raw_type, NamedType)
+            and raw_type.name == "ptr"
+            and len(raw_type.generic_args) == 1
+        ):
+            return raw_type.generic_args[0]
+        return None
+
+    def is_crossgl_pointer_type(self, vtype):
+        """Whether ``vtype`` is a CrossGL ``ptr<T>``, as a ``NamedType`` or spelled."""
+        if isinstance(vtype, NamedType):
+            return vtype.name == "ptr" and len(vtype.generic_args) == 1
+        type_name = str(self.type_name_string(vtype) or "").replace(" ", "")
+        return (
+            type_name.startswith("ptr<")
+            and type_name.endswith(">")
+            and "," not in type_name
+        )
+
+    def metal_crossgl_pointer_local_type(self, node, pointee):
+        """The C-style Metal pointer type of a CrossGL ``ptr<T>`` local.
+
+        The CrossGL spelling carries no address space, so the local takes the
+        one its initializer points into. Without an initializer, as for
+        ``var p: ptr<f32>;``, or with one whose address space is unknown, the
+        local is refused instead of being declared a ``thread`` pointer. A
+        pointer into device, constant or threadgroup memory keeps the native
+        width of a ``char`` or ``short`` pointee, as the buffers and
+        threadgroup arrays it points into do.
+        """
+        initial_value = getattr(node, "initial_value", None)
+        if initial_value is None:
+            return self.refuse_lowering(
+                f"pointer local: '{node.name}' has no initializer, so the address "
+                "space it points into is unknown",
+                "float*",
+            )
+        if (
+            self.local_variable_initializer_address_space(node) is None
+            # Branches in different address spaces are refused on their own.
+            and self.argument_address_space_conflict(initial_value) is None
+        ):
+            return self.refuse_lowering(
+                f"pointer local: the address space the initializer of '{node.name}' "
+                "points into is unknown",
+                "float*",
+            )
+        pointee_type = self.map_type(self.convert_type_node_to_string(pointee))
+        if self.local_variable_address_space(node) != "thread":
+            pointee_type = (
+                self.metal_native_narrow_bitcast_storage_type(pointee) or pointee_type
+            )
+        return f"{pointee_type}*"
+
     def local_variable_is_address_space_alias(self, node):
         raw_type = self.local_variable_type_node(node)
-        return isinstance(raw_type, (PointerType, ReferenceType)) or (
-            self.array_indirect_element_type_node(raw_type) is not None
+        return (
+            isinstance(raw_type, (PointerType, ReferenceType))
+            or self.local_variable_crossgl_pointer_pointee(node) is not None
+            or (self.array_indirect_element_type_node(raw_type) is not None)
         )
+
+    def local_variable_inherits_readonly_initializer(self, node):
+        """Whether a pointer local aliases a read-only parameter.
+
+        A CrossGL pointer local carries no qualifiers of its own, so a local
+        such as ``var src: ptr<f32> = in_;`` must inherit the constness of
+        the read-only storage parameter it aliases; otherwise Metal output
+        would drop ``const`` from the pointee and reject the initialization.
+        """
+        if self.local_variable_crossgl_pointer_pointee(node) is None:
+            return False
+        return self.points_into_readonly_metal_storage(
+            getattr(node, "initial_value", None)
+        )
+
+    def points_into_readonly_metal_storage(self, expr):
+        """Whether a pointer value may point into read-only storage.
+
+        Either branch of ``c ? in_ : out`` counts, as the C conditional
+        operator gives the result the union of both pointees' qualifiers. A
+        CrossGL pointer local that aliases read-only storage is recorded as
+        read-only itself (record_readonly_metal_local_alias), so a pointer
+        initialized from it, such as ``b = a + 1``, keeps ``const`` too.
+        """
+        if expr is None:
+            return False
+        if isinstance(expr, TernaryOpNode):
+            return self.points_into_readonly_metal_storage(
+                getattr(expr, "true_expr", None)
+            ) or self.points_into_readonly_metal_storage(
+                getattr(expr, "false_expr", None)
+            )
+        root = self.assignment_target_root_name(expr)
+        return root in getattr(self, "current_readonly_metal_parameters", set())
 
     def local_variable_is_array_alias(self, node):
         raw_type = self.local_variable_type_node(node)
@@ -9173,7 +9365,12 @@ class MetalCodeGen(
 
     def address_space_assignment_diagnostic(self, target, value, operator="="):
         target_type = self.expression_result_type(target)
-        if self.pointer_pointee_type_name(target_type) is None:
+        # A CrossGL `ptr<T>` local is a pointer too; `*p` and `p[i]` are not
+        # reassignments of it, so only the bare name is checked.
+        if self.pointer_pointee_type_name(target_type) is None and not (
+            isinstance(target, IdentifierNode)
+            and self.is_crossgl_pointer_type(target_type)
+        ):
             return None
         if operator in {"+=", "-="}:
             value_type = self.expression_result_type(value)
@@ -9461,6 +9658,7 @@ class MetalCodeGen(
                     "const" in qualifiers
                     or "readonly" in qualifiers
                     or self.local_variable_inherits_readonly_mesh_payload(node)
+                    or self.local_variable_inherits_readonly_initializer(node)
                     or self.local_variable_address_space_mismatch_diagnostic(node)
                     is not None
                 ):
@@ -9560,7 +9758,10 @@ class MetalCodeGen(
 
     def local_variable_address_space_conflict_diagnostic(self, node):
         raw_type = self.local_variable_type_node(node)
-        if not isinstance(raw_type, (PointerType, ReferenceType)):
+        if (
+            not isinstance(raw_type, (PointerType, ReferenceType))
+            and self.local_variable_crossgl_pointer_pointee(node) is None
+        ):
             return None
         conflict = self.argument_address_space_conflict(
             getattr(node, "initial_value", None)
@@ -9644,6 +9845,8 @@ class MetalCodeGen(
             return "constant address-space local alias"
         if "readonly" in qualifiers:
             return "readonly local alias"
+        if self.local_variable_inherits_readonly_initializer(node):
+            return "const-qualified local alias"
         return None
 
     def record_readonly_metal_local_alias(self, node):
@@ -11102,16 +11305,33 @@ class MetalCodeGen(
         narrow_update = (
             isinstance(expr, UnaryOpNode)
             and self.map_operator(expr.op) in {"++", "--"}
-            and self.metal_narrow_integer_conversion_expression(
-                "value", self.expression_result_type(expr.operand)
+            and (
+                self.metal_narrow_integer_conversion_expression(
+                    "value", self.expression_result_type(expr.operand)
+                )
+                is not None
+                or self.is_metal_signed_builtin_member(expr.operand)
             )
-            is not None
         )
-        if narrow_update or self.is_discarded_metal_type_constructor(expr):
+        if (
+            narrow_update
+            or self.is_discarded_metal_type_constructor(expr)
+            or self.is_discarded_metal_texel_atomic(expr, rendered)
+        ):
             # Postfix lowering reconstructs the old value after the stored update.
             # A discarded result must not trigger Metal's unused-value diagnostic.
             return f"(void)({rendered})"
         return rendered
+
+    def is_discarded_metal_texel_atomic(self, expr, rendered):
+        """Whether ``rendered`` selects ``.x`` of an image atomic's returned texel."""
+        if not isinstance(expr, FunctionCallNode) or not rendered.endswith(").x"):
+            return False
+        function = getattr(expr, "function", None) or getattr(expr, "name", None)
+        function_name = getattr(function, "name", function)
+        return isinstance(function_name, str) and function_name.startswith(
+            "imageAtomic"
+        )
 
     def is_discarded_metal_type_constructor(self, expr):
         if not isinstance(expr, FunctionCallNode):
@@ -11224,6 +11444,8 @@ class MetalCodeGen(
         )
         if stage_io_assignment is not None:
             return stage_io_assignment
+        if self.is_metal_signed_builtin_member(target):
+            return self.generate_metal_signed_builtin_member_assignment(target, rhs, op)
 
         mesh_output_store = self.generate_metal_mesh_output_assignment(
             target, rhs, op, getattr(node, "value", getattr(node, "right", None))
@@ -11333,6 +11555,41 @@ class MetalCodeGen(
                 reason="target-has-side-effects",
             )
         return f"{lhs} = {update}"
+
+    def is_metal_signed_builtin_member(self, expr):
+        """Whether ``expr`` reads a ``uint``-declared member that holds GLSL's ``int`` built-in value."""
+        if not self.metal_signed_builtin_members or not isinstance(
+            expr, MemberAccessNode
+        ):
+            return False
+        object_type = self.expression_result_type(getattr(expr, "object", None))
+        struct_name = self.type_name_string(self.member_lookup_type_name(object_type))
+        return str(getattr(expr, "member", "")) in (
+            self.metal_signed_builtin_members.get(struct_name, ())
+        )
+
+    def generate_metal_signed_builtin_member_storage(self, expr):
+        """The ``uint`` storage of a signed built-in member, without the conversion its reads take."""
+        self.metal_signed_member_raw_reads.add(id(expr))
+        try:
+            return self.generate_expression(expr)
+        finally:
+            self.metal_signed_member_raw_reads.discard(id(expr))
+
+    def generate_metal_signed_builtin_member_assignment(self, target, rhs, op):
+        lhs = self.generate_metal_signed_builtin_member_storage(target)
+        assignment = metal_signed_member_assignment(
+            lhs, op, rhs, self.metal_expression_is_side_effect_free(target)
+        )
+        if assignment is None:
+            raise UnsupportedMetalFeatureError(
+                "signed built-in member update",
+                f"Metal declares '{lhs}' uint; the signed '{op}' update of it "
+                "reads the target twice, and the target has side effects",
+                operation=op,
+                reason="target-has-side-effects",
+            )
+        return assignment
 
     def generate_metal_stage_io_lowered_assignment(self, target, rhs, op):
         if isinstance(target, MemberAccessNode):
@@ -12057,10 +12314,45 @@ class MetalCodeGen(
                 expr, self.generate_expression, self.generate_discarded_expression
             )
         elif isinstance(expr, ArrayLiteralNode):
-            elements = ", ".join(
-                self.generate_expression_with_expected(element, None)
-                for element in expr.elements
+            element_type, array_suffix = split_array_type_suffix(
+                self.current_expression_expected_type or ""
             )
+            matrix_element_type = (
+                element_type
+                if array_suffix.count("[") == 1
+                and self.is_matrix_value_type(element_type)
+                else None
+            )
+            # A structure's brace list gives each nested list its member's type,
+            # and an array of structures' list gives each its element type, so a
+            # matrix array member is written as the array above is.
+            nested_types = []
+            if element_type in self.struct_member_types and array_suffix:
+                nested_types = [
+                    self.metal_for_in_array_element_type(
+                        self.current_expression_expected_type
+                    )
+                ] * len(expr.elements)
+            elif element_type in self.struct_member_types:
+                nested_types = list(self.struct_member_types[element_type].values())
+            rendered_elements = []
+            for index, element in enumerate(expr.elements):
+                nested_type = (
+                    nested_types[index]
+                    if isinstance(element, ArrayLiteralNode)
+                    and index < len(nested_types)
+                    else None
+                )
+                rendered = self.generate_expression_with_expected(element, nested_type)
+                # A scalar cannot initialize a matrix element of a brace list, so
+                # write the matrix constructor, as GLSL output's mat3(0.0) does.
+                if (
+                    matrix_element_type is not None
+                    and self.expression_component_count(element) == 1
+                ):
+                    rendered = f"{self.map_type(matrix_element_type)}({rendered})"
+                rendered_elements.append(rendered)
+            elements = ", ".join(rendered_elements)
             return f"{{{elements}}}"
         elif isinstance(expr, PointerReinterpretNode):
             return self.generate_metal_storage_pointer_reinterpret(expr)
@@ -12089,8 +12381,18 @@ class MetalCodeGen(
             local_reinterpret = self.generate_metal_local_reinterpret_read(expr)
             if local_reinterpret is not None:
                 return local_reinterpret
-            operand = self.generate_unary_operand(expr.operand)
             operator = self.map_operator(expr.op)
+            if operator in {"++", "--"} and self.is_metal_signed_builtin_member(
+                expr.operand
+            ):
+                # The uint storage steps with the int's bits; the value read is converted back.
+                storage = self.generate_metal_signed_builtin_member_storage(
+                    expr.operand
+                )
+                if getattr(expr, "is_postfix", False):
+                    return f"int({storage}{operator})"
+                return f"int({operator}{storage})"
+            operand = self.generate_unary_operand(expr.operand)
             if operator in {"++", "--"}:
                 byte_update = self.metal_narrow_integer_update_expression(
                     expr, expr.operand, operator
@@ -12660,6 +12962,7 @@ class MetalCodeGen(
                     "float",
                     "half",
                     "float16",
+                    "float16_t",
                     "min16float",
                     "min10float",
                     "double",
@@ -12979,6 +13282,12 @@ class MetalCodeGen(
             stage_io_access = self.generate_metal_stage_io_lowered_member_access(expr)
             if stage_io_access is not None:
                 return stage_io_access
+            if id(
+                expr
+            ) not in self.metal_signed_member_raw_reads and self.is_metal_signed_builtin_member(
+                expr
+            ):
+                return f"int({self.generate_metal_signed_builtin_member_storage(expr)})"
             unsupported_value = (
                 self.unsupported_metal_ray_function_table_array_expression(expr)
             )
@@ -13653,7 +13962,7 @@ class MetalCodeGen(
             )
 
         rendered = [self.generate_expression(argument) for argument in arguments]
-        if operation == "fill":
+        if operation in {"fill", "diagonal"}:
             result_type = getattr(node, "result_type", None)
             contract = (
                 self.cooperative_matrix_contract(result_type)
@@ -13663,7 +13972,7 @@ class MetalCodeGen(
             if contract is None or len(arguments) != 1:
                 raise UnsupportedMetalFeatureError(
                     "cooperative-matrix-operation-lowering",
-                    "Metal cooperative-matrix fill requires one value and a "
+                    f"Metal cooperative-matrix {operation} requires one value and a "
                     "declared matrix result",
                     missing_capabilities=(
                         "metal.cooperative-matrix-operation-lowering",
@@ -13673,6 +13982,9 @@ class MetalCodeGen(
                     source_location=getattr(node, "source_location", None),
                 )
             matrix_type = self.map_cooperative_matrix_type(result_type, contract)
+            if operation == "diagonal":
+                # The one-value simdgroup_matrix constructor is the diagonal.
+                return f"{matrix_type}({rendered[0]})"
             fill_arguments = matrix_type[len("simdgroup_matrix") :]
             return f"make_filled_simdgroup_matrix{fill_arguments}({rendered[0]})"
         if operation == "element":
@@ -16787,7 +17099,7 @@ class MetalCodeGen(
         if array_size is not None:
             array_size = array_size or "1"
             return f"array<{pointer_type}, {array_size}> {name}"
-        return f"{pointer_type} {name}"
+        return f"{pointer_type}{metal_restrict_suffix(node)} {name}"
 
     def structured_buffer_length_resource_name(self, name):
         return self.metal_generated_companion_name(f"{name}Length")
@@ -17131,6 +17443,11 @@ class MetalCodeGen(
         }:
             return ""
         if semantic:
+            if shader_type == "fragment" and node is not None:
+                # A no-perspective barycentric input takes [[center_no_perspective]], as a member does.
+                implied = self.metal_semantic_implied_interpolation_attribute(node)
+                if implied is not None:
+                    return f"{self.map_semantic(semantic)} [[{implied}]]"
             return self.map_semantic(semantic)
         if shader_type in {
             "vertex",
@@ -17578,8 +17895,10 @@ class MetalCodeGen(
                 and self.parameter_qualifier_names(node) & {"out", "inout"}
                 else ""
             )
+            restrict = "" if reference else metal_restrict_suffix(node, raw_param_type)
             return (
-                f"{memory_qualifiers}{address_space} {pointee_type}*{reference} {name}"
+                f"{memory_qualifiers}{address_space} {pointee_type}*{restrict}"
+                f"{reference} {name}"
             )
 
         if isinstance(raw_param_type, ReferenceType):
@@ -17770,6 +18089,9 @@ class MetalCodeGen(
             kind = getattr(value, "kind", None)
             scope = getattr(value, "scope", None)
             text = str(value).lower()
+            if kind is None and text == "globallycoherent":
+                # HLSL's device-wide UAV coherence (Slang and the HLSL importer keep the HLSL name).
+                kind, scope = "coherent", "device"
             if kind is None:
                 match = re.fullmatch(
                     r"(?P<kind>volatile|coherent)(?:\((?P<scope>[a-z_][a-z0-9_]*)\))?",
@@ -17790,6 +18112,10 @@ class MetalCodeGen(
 
         for attribute in getattr(node, "attributes", []) or []:
             kind = str(getattr(attribute, "name", "")).lower()
+            if kind == "globallycoherent":
+                if ("coherent", "device") not in contracts:
+                    contracts.append(("coherent", "device"))
+                continue
             if kind not in {"volatile", "coherent"}:
                 continue
             arguments = getattr(attribute, "arguments", []) or []
@@ -18590,7 +18916,9 @@ class MetalCodeGen(
         if not root_name or target_name != root_name:
             return False
         local_type = self.type_name_string(self.local_variable_types.get(root_name))
-        return isinstance(local_type, str) and "*" in local_type
+        return isinstance(local_type, str) and (
+            "*" in local_type or self.is_crossgl_pointer_type(local_type)
+        )
 
     def readonly_metal_parameter_assignment_diagnostic(self, target):
         root_name = self.assignment_target_root_name(target)
@@ -21346,17 +21674,22 @@ class MetalCodeGen(
         return 1
 
     def format_metal_buffer_resource_parameter(
-        self, raw_type, name, array_size=None, address_space="device"
+        self, raw_type, name, array_size=None, address_space="device", node=None
     ):
         mapped_type = self.map_resource_type_with_format(raw_type)
+        memory = self.resource_memory_qualifier_prefix(node, raw_type) if node else ""
         if str(mapped_type).endswith("*"):
             if array_size is not None:
                 array_size = array_size or "1"
-                return f"array<{address_space} {mapped_type}, {array_size}> {name}"
-            return f"{address_space} {mapped_type} {name}"
+                return (
+                    f"array<{memory}{address_space} {mapped_type}, {array_size}> {name}"
+                )
+            restrict = metal_restrict_suffix(node, raw_type)
+            return f"{memory}{address_space} {mapped_type}{restrict} {name}"
         if array_size is not None:
-            return f"{address_space} {mapped_type}* {name}"
-        return f"{address_space} {mapped_type}& {name}"
+            restrict = metal_restrict_suffix(node, raw_type)
+            return f"{memory}{address_space} {mapped_type}*{restrict} {name}"
+        return f"{memory}{address_space} {mapped_type}& {name}"
 
     def register_metal_buffer_resource_parameter_scope(
         self, func_name, include_all=False
@@ -22007,9 +22340,14 @@ class MetalCodeGen(
             dependencies.add(buffer_name)
 
     def texture_sampling_uses_implicit_sampler(self, func_name):
-        return is_texture_sampling_operation(
-            func_name
-        ) or is_texture_query_lod_operation(func_name)
+        # A depth comparison of a combined sampler samples through its sampler too.
+        return (
+            is_texture_sampling_operation(func_name)
+            or is_texture_query_lod_operation(func_name)
+            or is_texture_compare_operation(func_name)
+            or is_texture_gather_compare_operation(func_name)
+            or is_projected_texture_compare_operation(func_name)
+        )
 
     def texture_call_needs_implicit_sampler_dependency(self, func_name, args):
         if not self.texture_sampling_uses_implicit_sampler(func_name):
@@ -22021,6 +22359,20 @@ class MetalCodeGen(
 
         if is_texture_sample_operation(func_name):
             return not self.is_multisample_texture_resource(texture_type)
+
+        if (
+            is_texture_compare_operation(func_name)
+            or is_texture_gather_compare_operation(func_name)
+            or is_projected_texture_compare_operation(func_name)
+        ):
+            if self.is_multisample_texture_resource(texture_type):
+                return False
+            if is_texture_compare_offset_operation(func_name) or str(
+                func_name
+            ).startswith("textureGatherCompareOffset"):
+                # Offsets the texture cannot take are refused, and need no sampler.
+                return self.texture_sample_supports_offset(texture_type)
+            return True
 
         if is_texture_query_lod_operation(func_name):
             return not (
@@ -22446,19 +22798,7 @@ class MetalCodeGen(
         return names
 
     def iter_ast_nodes(self, node):
-        if node is None or isinstance(node, (str, int, float, bool)):
-            return
-        if isinstance(node, (list, tuple, set)):
-            for item in node:
-                yield from self.iter_ast_nodes(item)
-            return
-        if not hasattr(node, "__dict__"):
-            return
-        yield node
-        for key, value in vars(node).items():
-            if key in {"parent", "annotations"}:
-                continue
-            yield from self.iter_ast_nodes(value)
+        return iter_ast_values(node)
 
     def literal_int_value(self, expr, constants=None):
         return evaluate_literal_int_expression(expr, constants)
@@ -22997,6 +23337,7 @@ class MetalCodeGen(
             unsupported_type_message=(
                 "type is not supported by Metal pointer/offset lowering"
             ),
+            component_refusal=metal_glsl_buffer_component_refusal,
         )
         self.record_metal_glsl_buffer_block_layout_failures(
             parameters, blocks, var_failures, struct_failures
@@ -23108,15 +23449,39 @@ class MetalCodeGen(
         )
         if isinstance(object_expr, (IdentifierNode, VariableNode)):
             name = getattr(object_expr, "name", None)
+            # A Metal buffer argument is a pointer and carries no size, so
+            # length() is refused whether the source spells it as a pointer
+            # (buffer float*) or as a typed buffer resource (StructuredBuffer,
+            # RWStructuredBuffer, Buffer, ...), which Metal also lowers to a
+            # device pointer. Without the resource spelling, the call was
+            # copied unchanged onto the pointer, which the Metal compiler
+            # rejects.
+            local_type = str(self.local_variable_types.get(name, ""))
             if self.current_address_space_variables.get(name) in {
                 "device",
                 "constant",
-            } and str(self.local_variable_types.get(name, "")).endswith("*"):
+            } and (
+                local_type.endswith("*")
+                or local_type.split("<", 1)[0] in COUNTED_BUFFERS
+            ):
                 raise BufferLengthUnsupportedError(
                     "metal",
                     f"length() of buffer view '{name}' needs the bound buffer's "
                     "size, which a Metal buffer argument does not carry",
                 )
+        # AppendStructuredBuffer and ConsumeStructuredBuffer are device
+        # pointers too, and so is an element of a structured buffer array:
+        # the name of bufs[1] is "bufs", recorded with the element's
+        # StructuredBuffer<T> type.
+        object_name = self.expression_name(object_expr)
+        if self.is_structured_buffer_type(
+            self.local_variable_types.get(object_name, "")
+        ):
+            raise BufferLengthUnsupportedError(
+                "metal",
+                f"length() of buffer view '{object_name}' needs the bound buffer's "
+                "size, which a Metal buffer argument does not carry",
+            )
         access = self.glsl_buffer_block_member_access(object_expr)
         if access is None or not access.get("is_array"):
             return None
@@ -23184,6 +23549,7 @@ class MetalCodeGen(
                 f"((*reinterpret_cast<const device uint*>"
                 f"({buffer_name} + {offset})) != 0u)"
             )
+        component_type = metal_buffer_component_type(component_type)
         return (
             f"(*reinterpret_cast<const device {component_type}*>"
             f"({buffer_name} + {offset}))"
@@ -23195,6 +23561,7 @@ class MetalCodeGen(
                 f"(*reinterpret_cast<device uint*>"
                 f"({buffer_name} + {offset})) = (({value}) ? 1u : 0u)"
             )
+        component_type = metal_buffer_component_type(component_type)
         return (
             f"(*reinterpret_cast<device {component_type}*>"
             f"({buffer_name} + {offset})) = {value}"
@@ -23221,7 +23588,7 @@ class MetalCodeGen(
 
         values = []
         for _, component_offset in vector_component_offsets(
-            offset, access["components"]
+            offset, access["components"], access.get("component_size", 4)
         ):
             values.append(
                 self.metal_scalar_load(
@@ -23241,7 +23608,9 @@ class MetalCodeGen(
 
         if access["components"] == 1:
             if access.get("layout_type") != access.get("type"):
-                value = f"{access['component_type']}({value})"
+                value = (
+                    f"{metal_buffer_component_type(access['component_type'])}({value})"
+                )
             return self.metal_scalar_store(
                 access["component_type"], buffer_name, offset, value
             )
@@ -23249,7 +23618,7 @@ class MetalCodeGen(
         temp_name = self.next_metal_temp_variable("buffer_store")
         lines = [f"{access['metal_type']} {temp_name} = {value}"]
         for component, component_offset in vector_component_offsets(
-            offset, access["components"]
+            offset, access["components"], access.get("component_size", 4)
         ):
             field = "xyzw"[component]
             lines.append(
@@ -26886,9 +27255,41 @@ class MetalCodeGen(
         constructor = self.image_store_constructors_by_kind().get(component_kind)
         if constructor is None:
             return value
-        return texel_store_value(
-            constructor, component_kind, value, self.value_component_count(value_type)
+        channels = self.value_component_count(value_type)
+        value = self.image_store_value_with_texel_elements(
+            value, value_type, image_type, channels
         )
+        return texel_store_value(constructor, component_kind, value, channels)
+
+    METAL_TEXEL_ELEMENT_TYPES = frozenset(
+        {"float", "half", "int", "uint", "short", "ushort"}
+    )
+
+    def image_store_value_with_texel_elements(
+        self, value, value_type, image_type, channels
+    ):
+        """``value`` with the element type of the texel ``write`` takes.
+
+        ``texture<T>::write`` takes ``vec<T, 4>`` of the texture's own ``T``
+        (``half4`` for ``texture2d<half>``) and MSL has no implicit conversion
+        between vector types, while GLSL converts a ``f16vec4`` argument to
+        ``vec4`` and HLSL converts on store. A vector of another element type
+        is converted explicitly before it is padded; a scalar converts inside
+        the splatting constructor.
+        """
+        if channels is None or channels < 2 or not value_type:
+            return value
+        agnostic = self.storage_image_access_agnostic_type(image_type)
+        if "<" not in str(agnostic):
+            return value
+        texel = str(agnostic).split("<", 1)[1].split(",", 1)[0].split(">", 1)[0]
+        texel = texel.strip()
+        if texel not in self.METAL_TEXEL_ELEMENT_TYPES:
+            return value
+        element = self.vector_component_type(value_type)
+        if element is None or element == texel:
+            return value
+        return f"{texel}{channels}({value})"
 
     def image_store_expected_value_type(self, image_type, image_format, value_arg=None):
         if value_arg is not None and self.is_vector_value_type(
@@ -27257,6 +27658,11 @@ class MetalCodeGen(
             if not helper_name:
                 return self.unsupported_image_atomic_call(func_name, image_type)
             self.required_image_atomic_compare_helpers.add(image_type)
+            # The helper takes signed coordinates; Metal converts no vector implicitly.
+            coord_type = self.image_atomic_compare_coord_type(image_type)
+            coord_value_type = self.expression_result_type(args[1])
+            if coord_value_type and self.map_type(str(coord_value_type)) != coord_type:
+                coord = f"{coord_type}({coord})"
             return f"{helper_name}({image_name}, {coord}, {compare}, {value})"
 
         atomic_method = self.image_atomic_method(func_name)

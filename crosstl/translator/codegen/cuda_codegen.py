@@ -41,6 +41,7 @@ from .array_utils import (
 from .assignment_values import assignment_value_expression
 from .c_family_operands import postfix_operand, prefix_unary_operand
 from .c_float_literals import c_float_literal_text
+from .c_narrow_integer_vectors import generic_narrow_vector_spelling
 from .c_pointer_math import generate_pointer_math_call
 from .c_reference_parameters import (
     is_output_parameter,
@@ -58,6 +59,7 @@ from .comma_expressions import (
     comma_result_operand,
     is_comma_expression,
 )
+from .cooperative_matrix_refusals import refuse_cooperative_matrices
 from .cuda_library_functions import rename_cuda_library_functions
 from .cuda_refusals import CudaLoweringRefused
 from .float_remainder_assignment import float_remainder_assignment
@@ -69,10 +71,12 @@ from .generic_function_utils import (
     generic_function_call_name,
     generic_function_emission_list,
     generic_function_parameters,
+    generic_function_specialization_named,
     iter_function_nodes,
     numeric_trait_method_result_type,
     prepare_generic_function_specializations,
     raise_unresolved_generic_function_call,
+    reject_unresolved_generic_function_call,
 )
 from .gpu_device_globals import (
     at_file_scope,
@@ -208,6 +212,8 @@ CUDA_SCALAR_CONSTRUCTOR_TYPE_ALIASES = {
     "u32",
     "i64",
     "u64",
+    "int64",
+    "uint64",
     "f32",
     "f64",
 }
@@ -400,6 +406,7 @@ class CudaCodeGen(
         A construct with no faithful CUDA lowering is refused; no program is returned while a refusal is
         pending, and a rendered program that still carries a ``/* unsupported ... */`` loss marker is refused.
         """
+        refuse_cooperative_matrices(ast_node, label="CUDA", target="cuda")
         return self.refusals.run(self.render_program, ast_node)
 
     def render_program(self, ast_node):
@@ -2755,9 +2762,7 @@ class CudaCodeGen(
             return None
         if len(components) == 1:
             return vector_info["component_type"]
-        return self.vector_type_for_components(
-            vector_info["component_type"], len(components)
-        )
+        return self.swizzle_vector_type(vector_info, len(components))
 
     def cuda_stage_builtin_alias_expression(self, name, component=None):
         role = self.stage_builtin_aliases.get(name)
@@ -3146,9 +3151,7 @@ class CudaCodeGen(
         )
         if object_info is None:
             return None
-        result_type = self.vector_type_for_components(
-            object_info["component_type"], len(components)
-        )
+        result_type = self.swizzle_vector_type(object_info, len(components))
         result_info = self.swizzle_result_vector_info(result_type)
         if result_info is None:
             return None
@@ -3456,7 +3459,7 @@ class CudaCodeGen(
         if specialized_func_name is not None:
             func_name = specialized_func_name
         else:
-            raise_unresolved_generic_function_call(self, func_name, "CUDA")
+            reject_unresolved_generic_function_call(self, func_name, "CUDA")
 
         args = [self.visit(arg) for arg in raw_args]
 
@@ -6428,9 +6431,7 @@ class CudaCodeGen(
         if len(components) == 1:
             return f"{object_expr}.{components[0]}"
 
-        result_type = self.vector_type_for_components(
-            vector_info["component_type"], len(components)
-        )
+        result_type = self.swizzle_vector_type(vector_info, len(components))
         result_info = self.swizzle_result_vector_info(result_type)
         if result_info is None:
             return None
@@ -6823,6 +6824,7 @@ class CudaCodeGen(
         crossgl_type = self.type_name_string(crossgl_type)
         if crossgl_type is None:
             return "void"
+        crossgl_type = generic_narrow_vector_spelling(crossgl_type) or crossgl_type
 
         geometry_stream_type = self.cuda_geometry_stream_mapped_type(crossgl_type)
         if geometry_stream_type is not None:
@@ -6867,6 +6869,8 @@ class CudaCodeGen(
             "u32": "unsigned int",
             "i64": "long long",
             "u64": "unsigned long long",
+            "int64": "long long",
+            "uint64": "unsigned long long",
             "f16": "half",
             "f32": "float",
             "f64": "double",
@@ -7525,13 +7529,8 @@ class CudaCodeGen(
             return None
         return self.structured_buffer_counter_name(name)
 
-    def cuda_user_function_call_arguments(self, func_name, raw_args, args):
-        """Expand user calls with CUDA sidecar resource arguments."""
-        callee = self.query_functions_by_name.get(func_name)
-        if callee is None:
-            return args + self.cuda_captured_function_call_args(func_name)
-
-        params = getattr(callee, "parameters", getattr(callee, "params", []))
+    def cuda_reject_unbindable_reference_arguments(self, func_name, params, raw_args):
+        """Refuse calls whose out/inout arguments cannot bind to references."""
         overlapping = overlapping_output_arguments(params, raw_args)
         if overlapping:
             raise CudaLoweringRefused(
@@ -7557,6 +7556,24 @@ class CudaCodeGen(
                     "and assign it back"
                 ]
             )
+
+    def cuda_user_function_call_arguments(self, func_name, raw_args, args):
+        """Expand user calls with CUDA sidecar resource arguments."""
+        callee = self.query_functions_by_name.get(func_name)
+        if callee is None:
+            specialized = generic_function_specialization_named(self, func_name)
+            if specialized is not None:
+                self.cuda_reject_unbindable_reference_arguments(
+                    func_name,
+                    getattr(
+                        specialized, "parameters", getattr(specialized, "params", [])
+                    ),
+                    raw_args,
+                )
+            return args + self.cuda_captured_function_call_args(func_name)
+
+        params = getattr(callee, "parameters", getattr(callee, "params", []))
+        self.cuda_reject_unbindable_reference_arguments(func_name, params, raw_args)
         query_params = self.query_metadata_function_params.get(func_name, set())
         expanded_args = []
         for index, arg in enumerate(args):
@@ -10146,6 +10163,7 @@ class CudaCodeGen(
 
     def convert_builtin_function(self, func_name):
         """Convert CrossGL built-in functions to CUDA equivalents"""
+        func_name = generic_narrow_vector_spelling(func_name) or func_name
         wide_vector_constructor = wide_integer_vector_constructor(func_name)
         if wide_vector_constructor is not None:
             return wide_vector_constructor
@@ -11377,6 +11395,7 @@ class CudaCodeGen(
             return None
 
         compact_type = "".join(str(type_text).split())
+        compact_type = generic_narrow_vector_spelling(compact_type) or compact_type
         if (
             len(compact_type) < 8
             or not compact_type.startswith("vec")
@@ -11404,6 +11423,7 @@ class CudaCodeGen(
             "constructor": f"make_{vector_type}",
             "component_type": component_type,
             "components": components,
+            "vector_element": scalar_type,
         }
 
     def require_cuda_half3_helper(self):
