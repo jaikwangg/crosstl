@@ -1632,12 +1632,12 @@ class MetalParser:
             idx += 1
             idx = self.skip_leading_attribute_tokens_at(idx)
 
-        if idx >= len(self.tokens) or not self.is_name_token_at(idx):
+        if idx >= len(self.tokens) or not self.is_function_name_token_at(idx):
             return False
         idx += 1
         while idx < len(self.tokens) and self.tokens[idx][0] == "SCOPE":
             idx += 1
-            if idx >= len(self.tokens) or not self.is_name_token_at(idx):
+            if idx >= len(self.tokens) or not self.is_function_name_token_at(idx):
                 return False
             idx += 1
 
@@ -2497,7 +2497,7 @@ class MetalParser:
             "LBRACKET",
         }:
             return False
-        return True
+        return not self.is_current_access_function_name()
 
     def skip_signed_type_prefix_at(self, idx):
         if (
@@ -2661,7 +2661,9 @@ class MetalParser:
                     self.current_token[0]
                 )
                 self.eat(self.current_token[0])
-        if not name and self.is_current_name_token():
+        if not name and (
+            self.is_current_name_token() or self.is_current_access_function_name()
+        ):
             name = self.current_token[1]
             self.eat(self.current_token[0])
             if self.template_argument_list_followed_by_call(
@@ -2777,6 +2779,21 @@ class MetalParser:
             or self.tokens[idx][0] in KEYWORD_IDENTIFIER_TOKENS
             or self.tokens[idx][0] in TYPE_IDENTIFIER_TOKENS
             or self.tokens[idx][0] == "COMPUTE"
+        )
+
+    def is_function_name_token_at(self, idx):
+        # read, write and read_write are access keywords only inside access
+        # qualifiers; a function may still use them as its name.
+        return self.is_name_token_at(idx) or self.tokens[idx][0] in {
+            "READ",
+            "WRITE",
+            "READ_WRITE",
+        }
+
+    def is_current_access_function_name(self):
+        return (
+            self.current_token[0] in {"READ", "WRITE", "READ_WRITE"}
+            and self.peek(1)[0] == "LPAREN"
         )
 
     def is_current_name_token(self):
@@ -3672,12 +3689,12 @@ class MetalParser:
         attributes.extend(self.parse_attributes())
 
         name = self.current_token[1]
-        if not self.is_current_name_token():
+        if not self.is_current_member_name_token():
             raise SyntaxError(f"Expected function name, got {self.current_token[0]}")
         self.eat(self.current_token[0])
         while self.current_token[0] == "SCOPE":
             self.eat("SCOPE")
-            if not self.is_current_name_token():
+            if not self.is_current_member_name_token():
                 raise SyntaxError(
                     f"Expected function name after '::', got {self.current_token[0]}"
                 )
@@ -5297,6 +5314,10 @@ class MetalParser:
                     self.tokens[self.pos - 1],
                 )
             return node
+        if self.is_current_access_function_name():
+            name = self.current_token[1]
+            self.eat(self.current_token[0])
+            return VariableNode("", name)
         raise SyntaxError(f"Unexpected token in expression: {self.current_token[0]}")
 
     def parse_lambda_expression(self):
