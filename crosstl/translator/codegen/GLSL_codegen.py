@@ -36868,9 +36868,10 @@ complex64_t crossgl_complex64_mod_assign(
         by a compile-time integer constant, ``float[N](x)``, is read as the
         constant's value; a specialization constant is not one. A constructor
         with more arguments than elements is refused, since that section allows
-        no extra argument. A constructor that has exactly enough arguments, or
-        an extent that is unsized or not a compile-time integer at any level,
-        is left exactly as it was.
+        no extra argument. A scalar given for a vector or matrix element is
+        written as that element type's constructor, ``vec3[2](vec3(1.0), ...)``,
+        since GLSL does not convert it. A constructor whose extent is unsized or
+        not a compile-time integer at any level is left exactly as it was.
         """
         if func_name is None:
             func_name = self.glsl_array_of_arrays_constructor_name(
@@ -36903,14 +36904,36 @@ complex64_t crossgl_complex64_mod_assign(
                 reason="element-count-mismatch",
                 source_location=getattr(expr, "source_location", None),
             )
-        if extent <= 0 or len(call_args) >= extent:
+        if extent <= 0:
             return call_args
-        padded = list(call_args)
+        padded = [
+            self.glsl_scalar_array_constructor_element(arg, element_type) or arg
+            for arg in call_args
+        ]
         padded.extend(
             self.glsl_value_initialized_expression(expr, element_type)
             for _ in range(extent - len(padded))
         )
         return padded
+
+    def glsl_scalar_array_constructor_element(self, arg, element_type):
+        """``vec3(x)`` or ``mat4(x)`` for a scalar ``x`` given for a vector or
+        matrix element of an array constructor, else ``None``.
+
+        GLSL 4.60 section 5.4.4 takes one value of the element type per
+        element and does not convert a scalar to a vector or matrix there.
+        CrossGL ``mat4(1.0)`` is the identity, as GLSL's is.
+        """
+        mapped_type = self.map_type(element_type)
+        is_matrix = self.glsl_matrix_dimensions(mapped_type) is not None
+        if not (is_matrix or self.is_vector_value_type(mapped_type)):
+            return None
+        actual = self.glsl_value_type_info(self.glsl_source_expression_type(arg))
+        if actual is None or actual["width"] != 1:
+            return None
+        if is_matrix:
+            return f"{mapped_type}({self.generate_expression(arg)})"
+        return self.generate_expression_with_expected(arg, element_type)
 
     @staticmethod
     def glsl_array_of_arrays_constructor_name(callee):
@@ -37422,8 +37445,15 @@ complex64_t crossgl_complex64_mod_assign(
                 reason="element-count-mismatch",
                 expected_element_count=expected_count,
             )
+        is_array = bool(split_array_type_suffix(str(constructor))[1])
         rendered = [
-            self.generate_expression_with_expected(element, element_types[index])
+            (
+                is_array
+                and self.glsl_scalar_array_constructor_element(
+                    element, element_types[index]
+                )
+            )
+            or self.generate_expression_with_expected(element, element_types[index])
             for index, element in enumerate(elements)
         ]
         rendered.extend(

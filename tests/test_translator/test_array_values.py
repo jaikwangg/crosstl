@@ -367,6 +367,54 @@ def test_glsl_keeps_array_constructors_sized_by_specialization_constants(tmp_pat
     assert "a = float[N](outp[i]);" in " ".join(code.split())
 
 
+SCALAR_ELEMENT_CONSTRUCTOR_CGL = """
+shader Probe {
+    buffer float* outp;
+    float first(vec3 v[2]) { return v[0].x; }
+    mat2[2] make(float s) { return mat2[2](s); }
+    compute {
+        layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+        void main() {
+            uint i = gl_GlobalInvocationID.x;
+            float s = outp[i];
+            mat4 a[3] = mat4[3](1.0);
+            mat2 b[2] = mat2[2](1.0, 2.0);
+            mat2x3 n[2] = mat2x3[2](s, 1.0);
+            vec3 v[2];
+            v = vec3[2](1.0, 2.0);
+            mat3 m[2];
+            m = mat3[2](0.0);
+            vec3 u[2];
+            u = vec3[2](s);
+            ivec2 k[2];
+            k = ivec2[2](1, ivec2(2, 3));
+            outp[i] = a[0][0][0] + b[1][0][0] + n[1][0][0] + v[1].x + m[1][0][0]
+                + u[0].x + float(k[0].y) + first(vec3[2](s, vec3(1.0)))
+                + make(s)[0][0][0];
+        }
+    }
+}
+"""
+
+
+def test_glsl_writes_scalar_vector_and_matrix_elements_as_constructors(tmp_path):
+    # GLSL takes one value of the element type per array element and does not
+    # convert a scalar to a vector or matrix there (#3636).
+    code = _translate(tmp_path, SCALAR_ELEMENT_CONSTRUCTOR_CGL, ".cgl", "opengl")
+    flat = " ".join(code.split())
+
+    assert "mat4 a[3] = mat4[3](mat4(1.0), mat4(0.0), mat4(0.0));" in flat
+    assert "mat2 b[2] = mat2[2](mat2(1.0), mat2(2.0));" in flat
+    assert "mat2x3 n[2] = mat2x3[2](mat2x3(s), mat2x3(1.0));" in flat
+    assert "v = vec3[2](vec3(1.0), vec3(2.0));" in flat
+    assert "m = mat3[2](mat3(0.0), mat3(0.0));" in flat
+    assert "u = vec3[2](vec3(s), vec3(0.0));" in flat
+    assert "k = ivec2[2](ivec2(1), ivec2(2, 3));" in flat
+    assert "first(vec3[2](vec3(s), vec3(1.0)))" in flat
+    assert "return mat2[2](mat2(s), mat2(0.0));" in flat
+    _validate_glsl(tmp_path, code, "comp")
+
+
 EXTRA_ARGUMENT_CONSTRUCTOR_CGL = """
 shader Probe {
     struct F { float m[1]; float w; };
